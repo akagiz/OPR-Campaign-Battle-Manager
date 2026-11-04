@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 ===============================================================================
- OPR Campaign & Battle Manager  v5
+ OPR Campaign & Battle Manager  v6
  Gestor de campañas y tableros para One Page Rules / for One Page Rules
 ===============================================================================
  Requisitos / Requirements : Python 3.8+  and  pygame 2.x  (pip install pygame)
@@ -22,6 +22,9 @@
      · v5: un ejército independiente por fuerza, catálogo OPR local (Army Forge con caché
        en «opr_db/»), economía austera, reclutamiento en Cuartel/Fortaleza, mantenimiento,
        rutas dinámicas, edificios locales y varias campañas simultáneas «[Tipo] nombre».
+     · v6: misiones/objetivos/eventos/secundarias en el generador de batalla, Cuartel
+       reequilibrado, terrenos de campaña con efectos (impasable, estéril, bonos, nexo),
+       modo solitario con IA y pestaña «Hall of Fame» de unidades destacadas.
  EN  · Tabs: 1 Campaign map · 2 Battle generator · 3 Factions/Resources
      · F11: fullscreen · ES/EN buttons: language · Ctrl+S: save
      · Ctrl+L: campaign files ("campaign/" folder)
@@ -111,7 +114,7 @@ DEFAULT_FACTION_NAMES = {
 # Edificios. cr/rr = ingreso por turno; rec = bajas recuperadas por turno;
 # ini/df = bonus de iniciativa/defensa. cost_cr/cost_rr = coste de construcción.
 BUILDINGS: Dict[str, dict] = {
-    "barracks": dict(color=(200, 74, 74), rr=2, cost_cr=12, cost_rr=0),
+    "barracks": dict(color=(200, 74, 74), rr=2, cr=1, cost_cr=22, cost_rr=0),
     "hospital": dict(color=(88, 200, 140), rec=2, cost_cr=12, cost_rr=0),
     "workshop": dict(color=(210, 150, 70), cr=2, cost_cr=9, cost_rr=0),
     "market": dict(color=(230, 200, 80), cr=1, rr=1, cost_cr=10, cost_rr=0),
@@ -167,24 +170,58 @@ _SYS_ALIASES = {
 }
 
 # Biomas (multiplicadores de terreno para la batalla)
+# Biomas del mapa de campaña. Banderas opcionales (efectos reales en la campaña):
+#   block  = terreno abrupto IMPASABLE (las fuerzas no entran; solo se cruza con rutas)
+#   sterile= no construible (ciénagas profundas, páramos radiactivos, cráteres)
+#   eco_cr / eco_rr = recursos extra por turno si el territorio está ocupado y abastecido
+#   nexus  = nodo logístico: une sin rutas a los demás nexos de la misma facción
 BIOMES: List[dict] = [
-    dict(color=(104, 126, 82),
+    dict(color=(104, 126, 82),                                   # 0 llanuras
          mult={"hill": 0.6, "forest": 0.5, "ruins": 0.5, "building": 0.4, "obstacle": 0.8,
                "marsh": 0.3, "crates": 0.6}),
-    dict(color=(48, 98, 62),
+    dict(color=(48, 98, 62),                                     # 1 bosque denso
          mult={"forest": 2.4, "hill": 0.8, "marsh": 0.8, "ruins": 0.5, "building": 0.3,
                "crates": 0.4}),
-    dict(color=(110, 108, 112),
+    dict(color=(110, 108, 112),                                  # 2 ruinas urbanas
          mult={"ruins": 2.2, "building": 2.0, "obstacle": 1.5, "crates": 1.3, "forest": 0.3,
                "marsh": 0.2}),
-    dict(color=(136, 112, 78),
+    dict(color=(136, 112, 78),                                   # 3 colinas
          mult={"hill": 2.4, "forest": 0.8, "obstacle": 0.8, "building": 0.3, "marsh": 0.2}),
-    dict(color=(72, 92, 66),
+    dict(color=(72, 92, 66), sterile=True,                       # 4 ciénaga profunda
          mult={"marsh": 3.0, "forest": 1.3, "hill": 0.4, "building": 0.2, "ruins": 0.5}),
-    dict(color=(124, 96, 80),
+    dict(color=(124, 96, 80),                                    # 5 páramo industrial
          mult={"crates": 2.4, "obstacle": 2.0, "building": 1.4, "ruins": 1.0, "forest": 0.2,
                "marsh": 0.2}),
+    dict(color=(92, 94, 108), block=True,                        # 6 montañas infranqueables
+         mult={"hill": 3.0, "obstacle": 1.5, "forest": 0.2, "building": 0.1, "marsh": 0.1}),
+    dict(color=(112, 130, 56), sterile=True,                     # 7 páramo radiactivo
+         mult={"marsh": 1.5, "crates": 1.2, "obstacle": 1.4, "building": 0.2, "forest": 0.1}),
+    dict(color=(100, 86, 72), sterile=True,                      # 8 cráter
+         mult={"hill": 1.6, "obstacle": 1.6, "ruins": 0.4, "building": 0.1, "forest": 0.1}),
+    dict(color=(124, 158, 78), eco_cr=1,                         # 9 valle fértil (+1 CR)
+         mult={"forest": 0.8, "hill": 0.6, "building": 0.6}),
+    dict(color=(162, 126, 60), eco_rr=1,                         # 10 yacimiento (+1 RR)
+         mult={"crates": 1.6, "building": 1.2, "obstacle": 1.2}),
+    dict(color=(76, 126, 150), nexus=True,                       # 11 nexo logístico
+         mult={"building": 1.4, "crates": 1.4}),
 ]
+BIOME_WEIGHTS = [20, 16, 14, 16, 8, 12, 5, 4, 4, 6, 5, 4]       # probabilidad al generar el mapa
+
+# Misiones del generador de batalla (orden = tirada de D6). Posiciones de objetivos como
+# fracciones del tablero, simétricas respecto al centro.
+MISSIONS = ["take_hold", "relic_hunt", "breakthrough", "domination", "sabotage", "control_points"]
+MISSION_LAYOUT = {
+    "take_hold": [(0.5, 0.5), (0.2, 0.5), (0.8, 0.5)],
+    "relic_hunt": [(0.5, 0.25), (0.5, 0.75), (0.3, 0.5), (0.7, 0.5)],
+    "breakthrough": [(0.25, 0.15), (0.75, 0.15), (0.25, 0.85), (0.75, 0.85)],
+    "domination": [(0.5, 0.5), (0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)],
+    "sabotage": [(0.3, 0.35), (0.7, 0.35), (0.3, 0.65), (0.7, 0.65)],
+    "control_points": [(0.2, 0.3), (0.5, 0.3), (0.8, 0.3), (0.2, 0.7), (0.5, 0.7), (0.8, 0.7)],
+}
+EXTRAS = ["reinforcements", "atmospheric", "late_arrival", "orbital", "supply_drop"]
+SIDES = ["assassinate", "first_strike", "hold_center", "linebreaker", "recon"]
+SIDE_REWARD = {"assassinate": (2, 1, 0), "first_strike": (1, 0, 1), "hold_center": (1, 1, 0),
+               "linebreaker": (1, 0, 1), "recon": (1, 1, 1)}          # (VP, CR, RR)
 
 NAME_PARTS = {
     "es": (["Cráter", "Valle", "Colina", "Paso", "Bastión", "Yermo", "Cuenca", "Meseta",
@@ -977,6 +1014,166 @@ T.update({
 })
 
 
+
+T.update({
+    # --- pestañas ---
+    "tab.campaign": ("1 · Campaña", "1 · Campaign"),
+    "tab.battle": ("2 · Batalla", "2 · Battle"),
+    "tab.factions": ("3 · Facciones", "3 · Factions"),
+    "tab.hall": ("4 · Hall of Fame", "4 · Hall of Fame"),
+    "status.hint": ("1/2/3/4: pestañas · F11: pantalla completa · Ctrl+S: guardar · Ctrl+L: campañas",
+                    "1/2/3/4: tabs · F11: fullscreen · Ctrl+S: save · Ctrl+L: campaigns"),
+    # --- Cuartel ---
+    "b.barracks.d": ("+2 RR y +1 CR por turno. Centro logístico: permite reclutar unidades en reserva.",
+                     "+2 RR and +1 CR per turn. Logistics hub: lets armies recruit reserve units."),
+    # --- terrenos de campaña ---
+    "biome.4": ("Ciénaga profunda", "Deep marsh"),
+    "biome.6": ("Montañas infranqueables", "Impassable mountains"),
+    "biome.7": ("Páramo radiactivo", "Radioactive wasteland"),
+    "biome.8": ("Cráter", "Crater"),
+    "biome.9": ("Valle fértil", "Fertile valley"),
+    "biome.10": ("Yacimiento de recursos", "Resource vein"),
+    "biome.11": ("Nexo logístico", "Logistics nexus"),
+    "terr.block": ("Impasable", "Impassable"),
+    "terr.block.d": ("Terreno abrupto: ninguna fuerza puede entrar. Solo se cruza con rutas.",
+                     "Rugged terrain: no force can enter. Can only be bypassed with routes."),
+    "terr.sterile": ("No construible", "No building"),
+    "terr.sterile.d": ("Terreno estéril: no se puede construir aquí.", "Barren terrain: nothing can be built here."),
+    "terr.eco_cr": ("+{n} CR", "+{n} CR"),
+    "terr.eco_cr.d": ("Bonificación económica: +{n} CR por turno si está ocupado y abastecido.",
+                      "Economic bonus: +{n} CR per turn if occupied and supplied."),
+    "terr.eco_rr": ("+{n} RR", "+{n} RR"),
+    "terr.eco_rr.d": ("Bonificación logística: +{n} RR por turno si está ocupado y abastecido.",
+                      "Logistic bonus: +{n} RR per turn if occupied and supplied."),
+    "terr.nexus": ("Nexo", "Nexus"),
+    "terr.nexus.d": ("Nodo logístico: se conecta sin rutas con los demás nexos de su facción.",
+                     "Logistics node: links without routes to the other nexuses of its faction."),
+    "err.sterile": ("Terreno estéril: no se puede construir.", "Barren terrain: building is not possible."),
+    "err.impassable": ("Terreno impasable: ninguna fuerza puede entrar.", "Impassable terrain: no force can enter."),
+    "camp.no_occupy": ("Terreno impasable: no se puede ocupar.", "Impassable terrain: cannot be occupied."),
+    "camp.legend_terr": ("Terrenos especiales", "Special terrain"),
+    # --- modo solitario / IA ---
+    "camp.solo": ("Solo: {s}", "Solo: {s}"),
+    "camp.solo_tip": ("Modo solitario/coop: las facciones marcadas como IA reclutan, construyen y se mueven solas al finalizar el turno.",
+                      "Solo/coop mode: AI-marked factions recruit, build and move on their own when the turn ends."),
+    "fac.ai": ("IA", "AI"),
+    "fac.ai_tip": ("Marca esta facción como controlada por la IA (solo en modo solitario).",
+                   "Marks this faction as AI-controlled (solo mode only)."),
+    "ai.unit": ("Tropa IA {n}", "AI troop {n}"),
+    "ai.auto": ("Resuelto automáticamente (IA contra IA).", "Auto-resolved (AI vs AI)."),
+    "log.ai_recruit": ("T{t} · IA {f} recluta {n} unidad(es).", "T{t} · AI {f} recruits {n} unit(s)."),
+    "log.ai_build": ("T{t} · IA {f} construye {b} en {q}.", "T{t} · AI {f} builds {b} in {q}."),
+    "log.ai_spawn": ("T{t} · IA {f} levanta {u} en reserva.", "T{t} · AI {f} raises {u} in reserve."),
+    "status.ai_done": ("Turno {n} resuelto. La IA ha actuado.", "Turn {n} resolved. The AI has acted."),
+    "dlg.solo": ("Solitario: {s}", "Solo: {s}"),
+    "dlg.solo_tip": ("Crea la campaña en modo solitario/coop (las facciones salvo la primera serán IA).",
+                     "Creates the campaign in solo/coop mode (all factions except the first are AI)."),
+    "bt.solo_note": ("Modo Solo/Coop: juega a la IA en mesa con las reglas Solo/Coop oficiales de OPR. El programa registra fuerzas, objetivos y el resultado.",
+                     "Solo/Coop mode: play the AI on the table with OPR's official Solo/Coop rules. The program records forces, objectives and the result."),
+    "bt.brief_forces": ("Fuerzas: {a} ({ua} uds, {pa} pts) vs {d} ({ud} uds, {pd} pts).",
+                        "Forces: {a} ({ua} units, {pa} pts) vs {d} ({ud} units, {pd} pts)."),
+    "bt.ctx_solo": (" · SOLO/COOP vs IA {f}", " · SOLO/COOP vs AI {f}"),
+    # --- misiones ---
+    "bt.tab_mission": ("Misión", "Mission"),
+    "ms.title": ("MISIÓN PRINCIPAL", "MAIN MISSION"),
+    "ms.random": ("Aleatoria (D6)", "Random (D6)"),
+    "ms.none": ("Sin misión", "No mission"),
+    "ms.rolled": ("D6 = {n}: {m}", "D6 = {n}: {m}"),
+    "ms.n": ("{n} objetivos en el tablero", "{n} objectives on the board"),
+    "ms.show": ("Objetivos: {s}", "Objectives: {s}"),
+    "ms.take_hold": ("Take & Hold", "Take & Hold"),
+    "ms.take_hold.d": ("3 objetivos en la línea central (centro y flancos). Al final de cada ronda cada jugador suma 1 VP por objetivo que controle.",
+                       "3 objectives on the centre line (centre and flanks). At the end of each round each player scores 1 VP per objective controlled."),
+    "ms.relic_hunt": ("Relic Hunt", "Relic Hunt"),
+    "ms.relic_hunt.d": ("4 reliquias en rombo alrededor del centro. Una unidad puede recoger una reliquia al tocarla; al final de la partida 1 VP por reliquia portada.",
+                        "4 relics in a diamond around the centre. A unit picks a relic up by touching it; at game end 1 VP per carried relic."),
+    "ms.breakthrough": ("Breakthrough", "Breakthrough"),
+    "ms.breakthrough.d": ("4 objetivos, 2 en cada zona de despliegue. Cada jugador puntúa 1 VP por cada objetivo enemigo que controle al final de las rondas 3 y 4.",
+                          "4 objectives, 2 in each deployment zone. Each player scores 1 VP per enemy objective controlled at the end of rounds 3 and 4."),
+    "ms.domination": ("Domination", "Domination"),
+    "ms.domination.d": ("5 objetivos (centro y cuatro cuadrantes). Al final de cada ronda quien controle más objetivos suma 1 VP; el centro cuenta doble.",
+                        "5 objectives (centre and four quadrants). At the end of each round whoever controls more objectives scores 1 VP; the centre counts double."),
+    "ms.sabotage": ("Sabotage", "Sabotage"),
+    "ms.sabotage.d": ("4 objetivos simétricos, 2 por mitad. Una unidad puede sabotear un objetivo enemigo como acción: 1 VP por objetivo saboteado.",
+                      "4 symmetric objectives, 2 per half. A unit can sabotage an enemy objective as an action: 1 VP per sabotaged objective."),
+    "ms.control_points": ("Control Points", "Control Points"),
+    "ms.control_points.d": ("6 puntos en dos filas de tres. Al final de cada ronda cada punto controlado da 1 VP; los de la fila central de cada mitad dan 2.",
+                            "6 points in two rows of three. At the end of each round each controlled point gives 1 VP; the middle point of each row gives 2."),
+    "ev.title": ("EVENTOS DE MISIÓN (giros)", "MISSION EVENTS (twists)"),
+    "ev.roll": ("Tirar evento", "Roll event"),
+    "ev.none": ("Ninguno", "None"),
+    "ev.rolled": ("Evento: {e}", "Event: {e}"),
+    "ev.reinforcements": ("Reinforcements", "Reinforcements"),
+    "ev.reinforcements.d": ("Refuerzos: cada jugador recibe una unidad extra a mitad de partida desde su borde.",
+                            "Reinforcements: each player gets an extra unit mid-game from their edge."),
+    "ev.atmospheric": ("Atmospheric Interference", "Atmospheric Interference"),
+    "ev.atmospheric.d": ("Interferencia atmosférica: -6'' al alcance de disparo y no se puede usar reserva aérea.",
+                         "Atmospheric interference: -6'' to shooting range and no aerial reserves."),
+    "ev.late_arrival": ("Late Arrival", "Late Arrival"),
+    "ev.late_arrival.d": ("Llegada tardía: una unidad de cada jugador entra desde su borde en la ronda 2.",
+                          "Late arrival: one unit of each player enters from their edge in round 2."),
+    "ev.orbital": ("Orbital Strikes", "Orbital Strikes"),
+    "ev.orbital.d": ("Ataques orbitales: al inicio de cada ronda se señala un punto; unidades a 3'' sufren impactos.",
+                     "Orbital strikes: at the start of each round a point is marked; units within 3'' take hits."),
+    "ev.supply_drop": ("Supply Drop", "Supply Drop"),
+    "ev.supply_drop.d": ("Caída de suministros: un contenedor (marcador S) cae en el centro; quien lo controle al final de la ronda 3 gana 1 VP.",
+                         "Supply drop: a crate (marker S) lands near the centre; whoever controls it at the end of round 3 scores 1 VP."),
+    "sd.title": ("MISIONES SECUNDARIAS (opcionales)", "SIDE MISSIONS (optional)"),
+    "sd.a": ("A: {s}", "A: {s}"),
+    "sd.b": ("B: {s}", "B: {s}"),
+    "sd.none": ("- ninguna -", "- none -"),
+    "sd.tip": ("Clic para cambiar; el botón D6 elige una al azar.", "Click to change; the D6 button picks one at random."),
+    "sd.reward": ("{vp} VP · +{cr} CR · +{rr} RR", "{vp} VP · +{cr} CR · +{rr} RR"),
+    "sd.assassinate": ("Assassinate Hero", "Assassinate Hero"),
+    "sd.assassinate.d": ("Elimina un Héroe enemigo.", "Kill an enemy Hero."),
+    "sd.first_strike": ("First Strike", "First Strike"),
+    "sd.first_strike.d": ("Causa la primera baja de la partida.", "Cause the first casualty of the game."),
+    "sd.hold_center": ("Hold Center", "Hold Center"),
+    "sd.hold_center.d": ("Controla el centro del tablero al final de la partida.", "Control the board centre at the end of the game."),
+    "sd.linebreaker": ("Linebreaker", "Linebreaker"),
+    "sd.linebreaker.d": ("Lleva una unidad a la zona de despliegue enemiga.", "Get a unit into the enemy deployment zone."),
+    "sd.recon": ("Reconnaissance", "Reconnaissance"),
+    "sd.recon.d": ("Deja a una unidad en cada mitad del tablero al final de la partida.", "End the game with a unit in each half of the board."),
+    "res.sec_a": ("Secundaria atacante cumplida", "Attacker side mission done"),
+    "res.sec_b": ("Secundaria defensor cumplida", "Defender side mission done"),
+    "res.rewards": (" Recompensas: {t}.", " Rewards: {t}."),
+    "camp.hist_mission": (" · {m}", " · {m}"),
+    "bt.mission_tag": (" · Misión: {m}", " · Mission: {m}"),
+    # --- Hall of Fame ---
+    "hall.title": ("HALL OF FAME · UNIDADES DESTACADAS", "HALL OF FAME · NOTABLE UNITS"),
+    "hall.empty": ("Aún no hay leyendas. Las unidades que alcancen el rango máximo o destaquen en XP y victorias aparecerán aquí.",
+                   "No legends yet. Units that reach the top rank or stand out in XP and victories will appear here."),
+    "hall.filter": ("Facción: {f}", "Faction: {f}"),
+    "hall.all": ("Todas", "All"),
+    "hall.legend": ("Leyenda", "Legend"),
+    "hall.top": ("Destacada", "Notable"),
+    "hall.manual": ("Manual", "Manual"),
+    "hall.stats": ("Calidad {q}+ · Defensa {d}+ · {s} modelo(s) · {p} pts · {st}",
+                   "Quality {q}+ · Defense {d}+ · {s} model(s) · {p} pts · {st}"),
+    "hall.record": ("Batallas: {b} · Supervivencias: {s} · Victorias clave: {w}",
+                    "Battles: {b} · Survived: {s} · Key victories: {w}"),
+    "hall.army": ("{f} · {a}", "{f} · {a}"),
+    "hall.advances": ("Avances: {t}", "Advances: {t}"),
+    "hall.rank": ("{r} · {x} XP", "{r} · {x} XP"),
+    "hall.title_lbl": ("Título honorífico", "Honorific title"),
+    "hall.note_lbl": ("Nota narrativa", "Narrative note"),
+    "hall.title_ph": ("p. ej. «El Terror de Ciénaga Alba»", "e.g. \"The Terror of Dawn Marsh\""),
+    "hall.chronicle": ("CRÓNICA DE BATALLAS", "BATTLE CHRONICLE"),
+    "hall.no_chronicle": ("Sin batallas registradas.", "No battles recorded."),
+    "hall.chr_line": ("T{t} · {q} · {r} contra {o} ({s})", "T{t} · {q} · {r} against {o} ({s})"),
+    "hall.win": ("victoria", "victory"),
+    "hall.loss": ("derrota", "defeat"),
+    "hall.draw": ("empate", "draw"),
+    "hall.remove": ("Quitar de la galería", "Remove from gallery"),
+    "hall.add": ("Hall of Fame: añadir", "Hall of Fame: add"),
+    "hall.add_tip": ("Añade manualmente esta unidad a la galería de leyendas.", "Manually adds this unit to the gallery of legends."),
+    "hall.rem_tip": ("La quita de la galería (si no cumple por sí sola los criterios automáticos).",
+                     "Removes it from the gallery (unless it qualifies on its own)."),
+    "hall.select": ("Selecciona una leyenda de la lista.", "Select a legend from the list."),
+    "hall.memorial": ("† En memoria", "† In memoriam"),
+})
+
+
 def tr(key: str, **kw) -> str:
     v = T.get(key)
     if v is None:
@@ -1160,6 +1357,13 @@ class ArmyUnit:
     spent: int = 0              # puntos de avance ya gastados
     advances: List[str] = field(default_factory=list)   # avances obtenidos
     unpaid: int = 0             # turnos seguidos sin pagar mantenimiento
+    battles: int = 0            # batallas en las que ha participado
+    survived: int = 0           # batallas en las que ha sobrevivido
+    wins: int = 0               # victorias clave (ganó y sobrevivió)
+    chronicle: List[dict] = field(default_factory=list)   # [{t, q, r, s, o}] últimas batallas
+    title: str = ""             # título honorífico (Hall of Fame)
+    legend_note: str = ""       # nota narrativa del jugador
+    hall: bool = False          # subida manual a la galería
 
 
 def default_rr(pts: int, pts_per_rr: int) -> int:
@@ -1894,6 +2098,7 @@ class BattleRecord:
     att_destroyed: int = 0     # de ellas, destruidas (irrecuperables)
     def_destroyed: int = 0
     note: str = ""
+    mission: str = ""          # misión principal jugada (clave de MISSIONS)
 
 
 @dataclass
@@ -1923,6 +2128,7 @@ class Faction:
     forces: List[Force] = field(default_factory=list)
     capital: Optional[List[int]] = None     # [col, row] = base principal / casilla de salida
     opr_faction: Optional[dict] = None      # {uid, name, system, gs} de Army Forge
+    ai: bool = False                        # controlada por la IA (modo solitario)
 
     @property
     def color(self):
@@ -1952,7 +2158,7 @@ class Quadrant:
 class Campaign:
     """Campaña completa: tipo/sistema, facciones (con sus ejércitos), mapa, rutas, turno y registro."""
 
-    def __init__(self, system: str = "GEN", base_name: Optional[str] = None):
+    def __init__(self, system: str = "GEN", base_name: Optional[str] = None, solo: bool = False):
         self.system = system if system in CAMPAIGN_TYPES else "GEN"
         self.name = compose_campaign_name(self.system, base_name or tr("dlg.default_name"))
         self.factions: List[Faction] = []
@@ -1964,12 +2170,25 @@ class Campaign:
         self.max_buildings = 0          # 0 = sin límite
         self.pts_per_rr = 25
         self.logistics = True
+        self.solo = False                       # modo solitario/coop con IA
         self.routes: List[List[int]] = []       # [c1, r1, c2, r2, fid]
         self.clashes: List[Clash] = []
         self.log: List[str] = []
         self.add_faction()
         self.add_faction()
         self.generate(5)
+        if solo:
+            self.set_solo(True)
+
+    # ---- modo solitario ----------------------------------------------------
+    def set_solo(self, on: bool):
+        self.solo = on
+        if on and len(self.factions) > 1 and not any(f.ai for f in self.factions):
+            for f in self.factions[1:]:
+                f.ai = True
+
+    def is_ai(self, f: Optional[Faction]) -> bool:
+        return bool(f is not None and self.solo and f.ai)
 
     # ---- tipo de campaña ----------------------------------------------------
     def set_system(self, code: str):
@@ -2025,11 +2244,18 @@ class Campaign:
     def has_route(self, c1, r1, c2, r2) -> bool:
         return any(rt[:4] in ([c1, r1, c2, r2], [c2, r2, c1, r1]) for rt in self.routes)
 
+    # ---- terreno de campaña ------------------------------------------------
+    def passable(self, q: Quadrant) -> bool:
+        return not BIOMES[q.biome].get("block", False)
+
+    def buildable(self, q: Quadrant) -> bool:
+        return self.passable(q) and not BIOMES[q.biome].get("sterile", False)
+
     def neighbors(self, c: int, r: int, fid: Optional[int] = None) -> List[Quadrant]:
-        """Adyacentes (4 dir.) y, si se indica fid, también extremos de rutas de esa facción."""
+        """Adyacentes transitables (4 dir.) y, si se indica fid, rutas y nexos logísticos de esa facción."""
         out: List[Quadrant] = []
         for dc, dr in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-            if self.in_bounds(c + dc, r + dr):
+            if self.in_bounds(c + dc, r + dr) and self.passable(self.quad(c + dc, r + dr)):
                 out.append(self.quad(c + dc, r + dr))
         for rt in self.routes:
             if fid is not None and rt[4] != fid:
@@ -2044,6 +2270,13 @@ class Campaign:
                 n = self.quad(*other)
                 if all(n is not o for o in out):
                     out.append(n)
+        if fid is not None and self.in_bounds(c, r):
+            me = self.quad(c, r)
+            if me.owner == fid and BIOMES[me.biome].get("nexus"):
+                for q in self.quads:
+                    if (q is not me and q.owner == fid and BIOMES[q.biome].get("nexus")
+                            and all(q is not o for o in out)):
+                        out.append(q)
         return out
 
     # ---- rutas dinámicas ----------------------------------------------------
@@ -2133,17 +2366,22 @@ class Campaign:
         self.seed = seed if seed is not None else random.randint(1, 999999)
         rng = random.Random(self.seed)
         part_a, part_b = NAME_PARTS.get(LANG, NAME_PARTS["es"])
+        spawns = [(0, 0), (self.cols - 1, self.rows - 1), (self.cols - 1, 0),
+                  (0, self.rows - 1), (self.cols // 2, 0), (self.cols // 2, self.rows - 1)]
         self.quads = []
         grid = [[None] * self.cols for _ in range(self.rows)]
         used = set()
         for r in range(self.rows):
             for c in range(self.cols):
-                if r > 0 and rng.random() < 0.35:
+                if r > 0 and rng.random() < 0.30:
                     biome = grid[r - 1][c].biome
-                elif c > 0 and rng.random() < 0.35:
+                elif c > 0 and rng.random() < 0.30:
                     biome = grid[r][c - 1].biome
                 else:
-                    biome = rng.randrange(len(BIOMES))
+                    biome = rng.choices(range(len(BIOMES)), weights=BIOME_WEIGHTS)[0]
+                if (c, r) in spawns[:max(2, len(self.factions))] and (
+                        BIOMES[biome].get("block") or BIOMES[biome].get("sterile")):
+                    biome = 0                    # las bases de salida siempre son transitables y construibles
                 name = ""
                 for _ in range(30):
                     a, b = rng.choice(part_a), rng.choice(part_b)
@@ -2154,9 +2392,8 @@ class Campaign:
                 q = Quadrant(c, r, name, biome)      # el mapa nace sin edificios ni rutas
                 grid[r][c] = q
                 self.quads.append(q)
+        self._ensure_connected(rng)
         self.routes = []
-        spawns = [(0, 0), (self.cols - 1, self.rows - 1), (self.cols - 1, 0),
-                  (0, self.rows - 1), (self.cols // 2, 0), (self.cols // 2, self.rows - 1)]
         for i, f in enumerate(self.factions):
             c, r = spawns[i % len(spawns)]
             q = self.quad(c, r)
@@ -2172,11 +2409,34 @@ class Campaign:
         self.turn = 1
         self.log = [tr("log.newmap", n=self.cols, seed=self.seed)]
 
+    def _ensure_connected(self, rng):
+        """Las zonas impasables nunca deben partir el mapa: si lo hacen, se convierten en colinas."""
+        def components():
+            free = [q for q in self.quads if self.passable(q)]
+            if not free:
+                return 0
+            seen = {(free[0].col, free[0].row)}
+            stack = [free[0]]
+            while stack:
+                q = stack.pop()
+                for dc, dr in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                    c, r = q.col + dc, q.row + dr
+                    if self.in_bounds(c, r) and (c, r) not in seen and self.passable(self.quad(c, r)):
+                        seen.add((c, r))
+                        stack.append(self.quad(c, r))
+            return len(seen) == len(free)
+        blocked = [q for q in self.quads if not self.passable(q)]
+        rng.shuffle(blocked)
+        while blocked and not components():
+            blocked.pop().biome = 3
+
     # ---- construcción -----------------------------------------------------
     def build_error(self, q: Quadrant, key: str) -> Optional[str]:
         owner = self.faction(q.owner)
         if owner is None:
             return "err.free"
+        if not self.buildable(q):
+            return "err.sterile"
         if self.logistics and not self.is_supplied(q):
             return "err.cutoff"
         if self.max_buildings and len(q.buildings) >= self.max_buildings:
@@ -2256,6 +2516,8 @@ class Campaign:
         fc = f.forces[fi]
         if fc.moved:
             return "err.moved"
+        if not self.passable(dest):
+            return "err.impassable"
         if not any(n is dest for n in self.neighbors(fc.col, fc.row, f.fid)):
             return "err.move_far"
         if dest.owner != f.fid and self.logistics:
@@ -2371,33 +2633,42 @@ class Campaign:
         return dict(ini=b["ini"], df=b["df"])
 
     def record_battle(self, q: Quadrant, att_fid, def_fid, winner: str, att_rows, def_rows,
-                      note: str = "", clash: Optional[Clash] = None) -> List[str]:
+                      note: str = "", clash: Optional[Clash] = None, mission: str = "") -> List[str]:
         """
         att_rows/def_rows: listas de (unidad, estado, xp) con estado 'ok' | 'fallen' | 'destroyed'.
-        Aplica bajas y XP, guarda la entrada en q.history y, si venía de un choque,
-        resuelve el movimiento (captura y retirada del derrotado).
+        Aplica bajas y XP, actualiza estadísticas/crónica de las unidades (Hall of Fame), guarda la
+        entrada en q.history y, si venía de un choque, resuelve el movimiento.
         """
         att, dfn = self.faction(att_fid), self.faction(def_fid)
+        att_name = att.name if att else "—"
+        def_name = dfn.name if dfn else tr("camp.neutral")
         msgs: List[str] = []
 
-        def apply(rows) -> Tuple[int, int]:
+        def apply(rows, side: str, other: str) -> Tuple[int, int]:
+            res = "draw" if winner == "draw" else ("win" if winner == side else "loss")
             lost = destroyed = 0
             for u, state, xp in rows:
                 if state in ("fallen", "destroyed"):
                     u.status = state
                     lost += 1
                     destroyed += state == "destroyed"
+                u.battles += 1
+                if state == "ok":
+                    u.survived += 1
+                    if res == "win":
+                        u.wins += 1
+                u.chronicle.append(dict(t=self.turn, q=quad_label(q.col, q.row), r=res, s=state, o=other))
+                u.chronicle = u.chronicle[-30:]
                 before = rank_of(u.xp)
                 u.xp += xp
                 if rank_of(u.xp) > before:
                     msgs.append(tr("log.rankup", u=u.name, r=rank_name(rank_of(u.xp))))
             return lost, destroyed
 
-        la, da = apply(att_rows)
-        ld, dd = apply(def_rows)
-        rec = BattleRecord(self.turn, time.strftime("%Y-%m-%d"), att_fid, def_fid,
-                           att.name if att else "—", dfn.name if dfn else tr("camp.neutral"),
-                           winner, la, ld, da, dd, note.strip())
+        la, da = apply(att_rows, "att", def_name)
+        ld, dd = apply(def_rows, "def", att_name)
+        rec = BattleRecord(self.turn, time.strftime("%Y-%m-%d"), att_fid, def_fid, att_name, def_name,
+                           winner, la, ld, da, dd, note.strip(), mission)
         q.history.append(rec)
         q.history = q.history[-60:]
         if clash is not None:
@@ -2447,6 +2718,8 @@ class Campaign:
                 continue
             counted += 1
             d["rr"] += BASE_RR
+            d["cr"] += BIOMES[q.biome].get("eco_cr", 0)        # bonos del terreno
+            d["rr"] += BIOMES[q.biome].get("eco_rr", 0)
             bonus = self.quad_bonus(q)
             d["cr"] += bonus["cr"]
             d["rr"] += bonus["rr"]
@@ -2454,6 +2727,8 @@ class Campaign:
         return d
 
     def end_turn(self):
+        if self.solo:
+            self.ai_turn()                       # las facciones IA reclutan, construyen y se mueven
         # 1) Hospitales: solo recuperan caídas de los ejércitos del dueño presentes en el territorio
         for q in self.quads:
             owner = self.faction(q.owner)
@@ -2510,10 +2785,157 @@ class Campaign:
         return dict(name=self.name, system=self.system, cols=self.cols, rows=self.rows,
                     seed=self.seed, turn=self.turn, next_fid=self.next_fid, log=self.log[-60:],
                     max_buildings=self.max_buildings, pts_per_rr=self.pts_per_rr,
-                    logistics=self.logistics, routes=self.routes,
+                    logistics=self.logistics, solo=self.solo, routes=self.routes,
                     clashes=[asdict(c) for c in self.clashes],
                     factions=[asdict(f) for f in self.factions],
                     quads=[asdict(q) for q in self.quads])
+
+    # ---- IA del modo solitario ------------------------------------------------
+    @staticmethod
+    def _dist(a: Tuple[int, int], b: Tuple[int, int]) -> int:
+        return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+    def ai_turn(self):
+        """Cada facción IA: levanta tropas, construye, recluta y mueve sus ejércitos; después se
+        resuelven automáticamente los choques entre dos IA (los choques con el jugador quedan pendientes)."""
+        for f in self.factions:
+            if self.is_ai(f):
+                self._ai_faction(f)
+        for cl in list(self.clashes):
+            a, d = self.faction(cl.att_fid), self.faction(cl.def_fid)
+            if self.is_ai(a) and self.is_ai(d):
+                self.auto_resolve(cl)
+
+    def _ai_faction(self, f: Faction):
+        self._ai_spawn(f)
+        self._ai_build(f)
+        recruited = 0
+        for fi, fc in enumerate(f.forces):
+            for u in sorted([u for u in fc.units if u.status == "reserve"], key=lambda x: -x.pts):
+                if self.recruit_error(f, fi, u) is None:
+                    self.change_status(f, fi, u, "active")
+                    recruited += 1
+        if recruited:
+            self.log.append(tr("log.ai_recruit", t=self.turn, f=f.name, n=recruited))
+        enemy_caps = [self.capital_of(g) for g in self.factions if g is not f]
+        enemy_caps = [(c.col, c.row) for c in enemy_caps if c is not None]
+        for fi, fc in enumerate(f.forces):
+            if fc.moved or not any(u.status == "active" for u in fc.units):
+                continue
+            dest = self._ai_pick_move(f, fi, fc, enemy_caps)
+            if dest is not None:
+                self.move_force(f, fi, dest)
+
+    def _ai_spawn(self, f: Faction):
+        """La IA levanta tropas genéricas en reserva para no quedarse sin ejército."""
+        if not f.forces:
+            return
+        alive = [u for u in f.all_units() if u.status != "destroyed"]
+        if len(alive) >= 3 + min(6, self.turn // 2):
+            return
+        pts = random.choice((90, 120, 150, 180))
+        u = ArmyUnit(name=tr("ai.unit", n=len(f.all_units()) + 1), size=5, quality=4, defense=4,
+                     pts=pts, rr_cost=default_rr(pts, self.pts_per_rr), status="reserve")
+        f.forces[0].units.append(u)
+        self.log.append(tr("log.ai_spawn", t=self.turn, f=f.name, u=u.name))
+
+    def _ai_build(self, f: Faction):
+        """Una construcción por turno: prioriza Taller y Mercado (economía) y conserva CR para el mantenimiento."""
+        owned = sorted([q for q in self.quads if q.owner == f.fid], key=lambda q: len(q.buildings))
+        for key in ("workshop", "market", "barracks", "fortress", "hospital", "tower"):
+            cost = BUILDINGS[key]["cost_cr"]
+            if f.cr - cost < self.upkeep(f):
+                continue
+            for q in owned:
+                if key not in q.buildings and self.build_error(q, key) is None:
+                    self.build(q, key)
+                    self.log.append(tr("log.ai_build", t=self.turn, f=f.name, b=bname(key),
+                                       q=quad_label(q.col, q.row)))
+                    return
+
+    def _ai_pick_move(self, f: Faction, fi: int, fc: Force, enemy_caps) -> Optional[Quadrant]:
+        origin = (fc.col, fc.row)
+        cap = self.capital_of(f)
+        if fi == 0 and cap is not None and origin == (cap.col, cap.row):      # defender la capital
+            for g in self.factions:
+                if g is not f and any(self._dist((e.col, e.row), origin) <= 2
+                                      and any(u.status == "active" for u in e.units) for e in g.forces):
+                    return None
+        my_pts = sum(u.pts for u in fc.units if u.status == "active")
+        best, best_s = None, 0.0
+        for n in self.neighbors(fc.col, fc.row, f.fid):
+            if self.move_error(f, fi, n):
+                continue
+            here = [(g, gf) for g, _j, gf in self.forces_at(n.col, n.row) if g is not f]
+            pts_here = sum(u.pts for _g, gf in here for u in gf.units if u.status == "active")
+            s = 0.0
+            if n.owner is None:
+                s += 3.0                                                    # expandirse a neutrales
+            elif n.owner != f.fid:                                          # atacar al más débil
+                s += 5.0 - pts_here / 100.0 - 1.5 * n.buildings.count("fortress") + 0.6 * len(n.buildings)
+                if here and my_pts < pts_here * 0.7:
+                    s -= 4.0
+            else:
+                s += 0.5
+            if enemy_caps:
+                d0 = min(self._dist(origin, c) for c in enemy_caps)
+                d1 = min(self._dist((n.col, n.row), c) for c in enemy_caps)
+                s += (d0 - d1) * 0.8
+            s += BIOMES[n.biome].get("eco_cr", 0) + BIOMES[n.biome].get("eco_rr", 0)
+            s += random.uniform(0, 0.5)
+            if s > best_s:
+                best, best_s = n, s
+        return best
+
+    def auto_resolve(self, cl: Clash):
+        """Resuelve un choque IA contra IA comparando puntos con algo de azar."""
+        q = self.quad(cl.col, cl.row)
+        a, d = self.faction(cl.att_fid), self.faction(cl.def_fid)
+        if a is None or d is None or cl.att_force >= len(a.forces) or cl.def_force >= len(d.forces):
+            if cl in self.clashes:
+                self.clashes.remove(cl)
+            return
+        ua = [u for u in a.forces[cl.att_force].units if u.status == "active"]
+        ud = [u for u in d.forces[cl.def_force].units if u.status == "active"]
+        pa, pd = sum(u.pts for u in ua) + 50, sum(u.pts for u in ud) + 50
+        winner = "att" if random.random() * pa > random.random() * pd * 1.1 else "def"
+
+        def rows(units, won):
+            out = []
+            for u in units:
+                state = "ok"
+                if random.random() < (0.15 if won else 0.45):
+                    state = "destroyed" if random.random() < 0.25 else "fallen"
+                out.append((u, state, 0 if state != "ok" else (2 if won else 1)))
+            return out
+
+        self.record_battle(q, a.fid, d.fid, winner, rows(ua, winner == "att"), rows(ud, winner == "def"),
+                           tr("ai.auto"), cl)
+
+    # ---- Hall of Fame -----------------------------------------------------------
+    def hall_entries(self) -> List[tuple]:
+        """[(facción, índice de ejército, unidad, motivo)] de las unidades destacadas, mejores primero.
+        Motivos: 'legend' (rango máximo), 'manual' (subida a mano) o 'top' (5 mejores por XP + 2*victorias)."""
+        allu = [(f, i, u) for f in self.factions for i, fc in enumerate(f.forces) for u in fc.units]
+
+        def score(u):
+            return u.xp + 2 * u.wins
+
+        ranked = sorted([e for e in allu if score(e[2]) > 0], key=lambda e: -score(e[2]))
+        top = {id(e[2]) for e in ranked[:5]}
+        out = []
+        for f, i, u in allu:
+            if rank_of(u.xp) >= len(RANK_XP) - 1:
+                reason = "legend"
+            elif u.hall:
+                reason = "manual"
+            elif id(u) in top:
+                reason = "top"
+            else:
+                continue
+            out.append((f, i, u, reason))
+        out.sort(key=lambda e: (-score(e[2]), e[2].name))
+        return out
 
     def ensure_forces(self):
         """Toda facción con territorio dispone al menos de un ejército (en su capital)."""
@@ -2573,6 +2995,7 @@ class Campaign:
         c.max_buildings = int(d.get("max_buildings", 0))
         c.pts_per_rr = int(d.get("pts_per_rr", 25))
         c.logistics = bool(d.get("logistics", False))      # partidas antiguas: sin logística
+        c.solo = bool(d.get("solo", False))
         c.routes = [[int(x) for x in rt] for rt in d.get("routes", [])]
         c.clashes = [_mk(Clash, x) for x in d.get("clashes", [])]
         c.log = list(d.get("log", []))
@@ -2681,6 +3104,14 @@ class BattleState:
         self.depth: Optional[float] = None  # profundidad de zona en cm (None = automática)
         self.flip = False                  # intercambia qué jugador ocupa cada zona
         self.condition = ""                # condición del campo de batalla (clave de regla)
+        self.mission = ""                  # misión principal (clave de MISSIONS)
+        self.objectives: List[List[float]] = []     # [x, y] en cm de los marcadores de objetivo
+        self.show_obj = True
+        self.extras: List[str] = []        # eventos de misión activos (EXTRAS)
+        self.side_a = ""                   # misión secundaria del jugador A (atacante)
+        self.side_b = ""                   # misión secundaria del jugador B (defensor)
+        self.solo = False                  # batalla del modo solitario/coop contra la IA
+        self.briefing = ""                 # resumen de fuerzas / nota Solo-Coop
         self.auto_counts()
 
     @property
@@ -2690,6 +3121,29 @@ class BattleState:
     @property
     def H(self) -> int:
         return BOARD_SIZES[self.size_idx][1]
+
+    # ---- misiones y objetivos -----------------------------------------------
+    def place_objectives(self):
+        """Coloca los marcadores de la misión en posiciones simétricas respecto al centro del tablero."""
+        lay = MISSION_LAYOUT.get(self.mission)
+        if not lay:
+            self.objectives = []
+            return
+        m = 6.0
+        self.objectives = [[round(clamp(fx * self.W, m, self.W - m) * 2) / 2,
+                            round(clamp(fy * self.H, m, self.H - m) * 2) / 2] for fx, fy in lay]
+
+    def set_mission(self, key: str):
+        self.mission = key if key in MISSION_LAYOUT else ""
+        self.place_objectives()
+
+    def supply_pos(self) -> Tuple[float, float]:
+        """Posición del contenedor del evento Supply Drop (libre de objetivos)."""
+        for fx, fy in ((0.5, 0.5), (0.5, 0.38), (0.38, 0.5)):
+            x, y = fx * self.W, fy * self.H
+            if all(math.hypot(x - ox, y - oy) > 7 for ox, oy in self.objectives):
+                return x, y
+        return 0.5 * self.W, 0.38 * self.H
 
     # ---- despliegue -------------------------------------------------------
     def auto_depth(self) -> float:
@@ -2754,6 +3208,7 @@ class BattleState:
             self.counts[k] = int(round(self.counts[k] * ratio))
         self.pieces = []
         self.sel_piece = None
+        self.place_objectives()
         self.last_msg = tr("bt.size_msg", w=self.W, h=self.H)
 
     def add_custom_type(self) -> Optional[TerrainType]:
@@ -2854,7 +3309,9 @@ class BattleState:
                     counts=self.counts, context=self.context,
                     custom_counter=self.custom_counter, sel_type=self.sel_type,
                     deploy=self.deploy, depth=self.depth, flip=self.flip,
-                    condition=self.condition,
+                    condition=self.condition, mission=self.mission, objectives=self.objectives,
+                    show_obj=self.show_obj, extras=self.extras, side_a=self.side_a,
+                    side_b=self.side_b, solo=self.solo, briefing=self.briefing,
                     types=[asdict(t) for t in self.types],
                     pieces=[asdict(p) for p in self.pieces])
 
@@ -2877,6 +3334,16 @@ class BattleState:
         b.depth = float(d["depth"]) if d.get("depth") else None
         b.flip = bool(d.get("flip", False))
         b.condition = d.get("condition") if d.get("condition") in RULE_CATS else ""
+        b.mission = d.get("mission") if d.get("mission") in MISSION_LAYOUT else ""
+        b.objectives = [[float(o[0]), float(o[1])] for o in d.get("objectives", []) if len(o) >= 2]
+        if b.mission and not b.objectives:
+            b.place_objectives()
+        b.show_obj = bool(d.get("show_obj", True))
+        b.extras = [e for e in d.get("extras", []) if e in EXTRAS]
+        b.side_a = d.get("side_a") if d.get("side_a") in SIDES else ""
+        b.side_b = d.get("side_b") if d.get("side_b") in SIDES else ""
+        b.solo = bool(d.get("solo", False))
+        b.briefing = str(d.get("briefing", ""))
         b.counts = {k: int(v) for k, v in d.get("counts", {}).items()}
         for t in b.types:
             b.counts.setdefault(t.key, 0)
@@ -3047,6 +3514,23 @@ def draw_board(surf, b: BattleState, ox, oy, sc, fonts, sel=None, flag_overlap=T
     for i, p in enumerate(b.pieces):
         draw_terrain_piece(surf, p, b.type_by_key(p.type_key), ox, oy, sc, fonts,
                            selected=(i == sel), bad=(i in bad))
+    if b.show_obj and b.objectives:                      # marcadores de objetivo numerados
+        rad = max(9, int(2.2 * sc))
+        for i, (px_, py_) in enumerate(b.objectives):
+            cx, cy = int(ox + px_ * sc), int(oy + py_ * sc)
+            pygame.draw.circle(surf, (30, 24, 8), (cx, cy), rad + 3)
+            pygame.draw.circle(surf, (242, 202, 72), (cx, cy), rad)
+            pygame.draw.circle(surf, (130, 86, 10), (cx, cy), rad, 2)
+            t = fonts["s"].render(str(i + 1), True, (40, 26, 4))
+            surf.blit(t, t.get_rect(center=(cx, cy)))
+    if "supply_drop" in b.extras:                        # contenedor del evento Supply Drop
+        sx, sy = b.supply_pos()
+        cx, cy = int(ox + sx * sc), int(oy + sy * sc)
+        half = max(8, int(1.8 * sc))
+        pygame.draw.rect(surf, (60, 190, 210), (cx - half, cy - half, half * 2, half * 2), border_radius=3)
+        pygame.draw.rect(surf, (10, 60, 70), (cx - half, cy - half, half * 2, half * 2), 2, border_radius=3)
+        t = fonts["s"].render("S", True, (10, 40, 50))
+        surf.blit(t, t.get_rect(center=(cx, cy)))
     pygame.draw.rect(surf, (20, 22, 26), board, 3)
 
     for x in range(0, W + 1, 10):
@@ -3068,6 +3552,8 @@ def export_battle(b: BattleState, fonts) -> Tuple[str, str]:
     draw_board(surf, b, margin, margin, sc, fonts, sel=None, flag_overlap=False)
     title = tr("bt.exp_title", w=b.W, h=b.H, n=len(b.pieces), s=b.seed)
     title += f" · {tr('deploy.' + b.deploy)}"
+    if b.mission:
+        title += f" · {tr('ms.' + b.mission)} ({len(b.objectives)})"
     if b.condition:
         title += f" · {rname(b.condition)}"
     if b.context:
@@ -3403,6 +3889,11 @@ class CampaignView(View):
             rects[(q.col, q.row)] = r
             inner = r.inflate(-4, -4)
             pygame.draw.rect(scr, BIOMES[q.biome]["color"], inner, border_radius=6)
+            if BIOMES[q.biome].get("block"):                   # terreno impasable: rayado diagonal
+                hv = pygame.Surface(inner.size, pygame.SRCALPHA)
+                for k in range(-inner.h, inner.w, 12):
+                    pygame.draw.line(hv, (20, 22, 30, 190), (k, inner.h), (k + inner.h, 0), 3)
+                scr.blit(hv, inner.topleft)
             owner = camp.faction(q.owner)
             if owner:
                 ov = pygame.Surface(inner.size, pygame.SRCALPHA)
@@ -3434,6 +3925,7 @@ class CampaignView(View):
             tag = tr("camp.free") if not owner else owner.name
             ui.text(ui.fit(tag, "xs", inner.w - 70), (inner.x + 7, inner.bottom - 50), "xs",
                     (255, 255, 255) if owner else (200, 205, 215))
+            self.draw_terrain_icons(ui, q, inner)
             # marcas: capital (rombo dorado), aislado (!), choque pendiente (X)
             mx, my = inner.right - 12, inner.bottom - 44
             if owner and camp.capital_of(owner) is q:
@@ -3500,15 +3992,62 @@ class CampaignView(View):
             if ui.button((bx, 150, w, 26), lab, active=(camp.max_buildings == lim), font="xs",
                          tip=tr("camp.maxb_tip")):
                 camp.max_buildings = lim
-        if ui.button((px + 12, 184, 170, 28), tr("camp.logistics", s=tr("on") if camp.logistics else tr("off")),
+        if ui.button((px + 12, 184, 140, 28), tr("camp.logistics", s=tr("on") if camp.logistics else tr("off")),
                      active=camp.logistics, tip=tr("camp.logistics_tip"), font="xs"):
             camp.logistics = not camp.logistics
-        if ui.button((px + 190, 184, 188, 28), tr("camp.end_turn"), color=(150, 100, 30)):
+        if ui.button((px + 156, 184, 100, 28), tr("camp.solo", s=tr("on") if camp.solo else tr("off")),
+                     active=camp.solo, tip=tr("camp.solo_tip"), font="xs"):
+            camp.set_solo(not camp.solo)
+        if ui.button((px + 260, 184, 118, 28), tr("camp.end_turn"), color=(150, 100, 30), font="xs"):
             camp.end_turn()
             self.sel_force = None
-            self.app.set_status(tr("status.turn_done", n=camp.turn - 1))
+            self.app.set_status(tr("status.ai_done" if camp.solo else "status.turn_done", n=camp.turn - 1))
 
         self.draw_details(ui, px, 230, pw, 462)
+
+    @staticmethod
+    def biome_tags(q: Quadrant) -> List[tuple]:
+        """[(texto, color, descripción)] de los efectos especiales del bioma de un territorio."""
+        bio = BIOMES[q.biome]
+        tags = []
+        if bio.get("block"):
+            tags.append((tr("terr.block"), (232, 110, 110), tr("terr.block.d")))
+        if bio.get("sterile"):
+            tags.append((tr("terr.sterile"), (236, 150, 80), tr("terr.sterile.d")))
+        if bio.get("eco_cr"):
+            tags.append((tr("terr.eco_cr", n=bio["eco_cr"]), (240, 200, 80), tr("terr.eco_cr.d", n=bio["eco_cr"])))
+        if bio.get("eco_rr"):
+            tags.append((tr("terr.eco_rr", n=bio["eco_rr"]), (110, 215, 140), tr("terr.eco_rr.d", n=bio["eco_rr"])))
+        if bio.get("nexus"):
+            tags.append((tr("terr.nexus"), (120, 215, 240), tr("terr.nexus.d")))
+        return tags
+
+    def draw_terrain_icons(self, ui, q, inner):
+        """Iconos del efecto del terreno (fila central derecha): montaña, no-construir, +CR/+RR, nexo."""
+        bio = BIOMES[q.biome]
+        scr = ui.screen
+        x, y = inner.right - 14, inner.centery
+        if bio.get("block"):
+            pts = [(x - 9, y + 7), (x, y - 9), (x + 9, y + 7)]
+            pygame.draw.polygon(scr, (205, 205, 220), pts)
+            pygame.draw.polygon(scr, (25, 25, 34), pts, 2)
+            x -= 22
+        if bio.get("sterile"):
+            pygame.draw.circle(scr, (24, 20, 18), (x, y), 9)
+            pygame.draw.circle(scr, (236, 140, 70), (x, y), 9, 2)
+            pygame.draw.line(scr, (236, 140, 70), (x - 6, y + 6), (x + 6, y - 6), 2)
+            x -= 22
+        for key, col, lab in (("eco_cr", (240, 200, 80), "C"), ("eco_rr", (110, 215, 140), "R")):
+            if bio.get(key):
+                pygame.draw.circle(scr, (24, 24, 20), (x, y), 9)
+                pygame.draw.circle(scr, col, (x, y), 9, 2)
+                ui.text("+" + lab, (x, y), "xs", col, "center")
+                x -= 22
+        if bio.get("nexus"):
+            pts = [(x, y - 9), (x + 9, y), (x, y + 9), (x - 9, y)]
+            pygame.draw.polygon(scr, (20, 36, 50), pts)
+            pygame.draw.polygon(scr, (120, 215, 240), pts, 2)
+            ui.text("N", (x, y), "xs", (120, 215, 240), "center")
 
     # ------------------------------------------------------------------
     def draw_links(self, ui, camp, rects, supply):
@@ -3607,6 +4146,17 @@ class CampaignView(View):
         y += 28
         pygame.draw.rect(ui.screen, BIOMES[q.biome]["color"], (x, y + 2, 14, 14), border_radius=3)
         ui.text(tr("camp.biome", b=biome_name(q.biome)), (x + 22, y), "s", C_DIM)
+        tags = self.biome_tags(q)
+        tx = px + pw - 14
+        for txt, col, _d in reversed(tags):
+            w = ui.f["xs"].size(txt)[0] + 10
+            tr_ = pygame.Rect(tx - w, y, w, 18)
+            pygame.draw.rect(ui.screen, (24, 27, 34), tr_, border_radius=4)
+            pygame.draw.rect(ui.screen, col, tr_, 1, border_radius=4)
+            ui.text(txt, tr_.center, "xs", col, "center")
+            tx -= w + 4
+        if tags and ui.over((x, y, pw - 28, 18)):
+            ui.tip = "  |  ".join(t[2] for t in tags)
         y += 20
         if owner:
             pygame.draw.rect(ui.screen, owner.color, (x, y + 2, 14, 14), border_radius=3)
@@ -3639,7 +4189,8 @@ class CampaignView(View):
         bw = (pw - 28 - 8) // 3
         for i, f in enumerate(camp.factions):
             rr = (x + (i % 3) * (bw + 4), y + (i // 3) * 30, bw, 26)
-            if ui.button(rr, f.name, color=f.color, active=(q.owner == f.fid), font="xs"):
+            if ui.button(rr, f.name, color=f.color, active=(q.owner == f.fid), font="xs",
+                         enabled=camp.passable(q), tip=tr("camp.no_occupy") if not camp.passable(q) else None):
                 q.owner = f.fid
         y += max(1, (len(camp.factions) + 2) // 3) * 30
         if ui.button((x, y, 170, 26), tr("camp.release"), enabled=q.owner is not None):
@@ -3781,7 +4332,10 @@ class CampaignView(View):
                              border_radius=2)
             wtxt = (tr("camp.won", f=rec.att_name) if rec.winner == "att" else
                     tr("camp.won", f=rec.def_name) if rec.winner == "def" else tr("camp.draw"))
-            ui.text(tr("camp.hist_l1", t=rec.turn, d=rec.date), (row.x + 12, row.y + 3), "xs", C_DIM)
+            l1 = tr("camp.hist_l1", t=rec.turn, d=rec.date)
+            if rec.mission in MISSION_LAYOUT:
+                l1 += tr("camp.hist_mission", m=tr("ms." + rec.mission))
+            ui.text(l1, (row.x + 12, row.y + 3), "xs", C_DIM)
             l2 = tr("camp.hist_l2", a=rec.att_name, b=rec.def_name, w=wtxt, la=rec.att_losses, ld=rec.def_losses)
             if rec.att_destroyed or rec.def_destroyed:
                 l2 += tr("camp.destroyed_note", a=rec.att_destroyed, d=rec.def_destroyed)
@@ -3868,13 +4422,15 @@ class BattleView(View):
         scr = ui.screen
         ui.panel((8, 54, 316, 640))
         for i, (key, lab) in enumerate((("terrain", "bt.tab_terrain"), ("deploy", "bt.tab_deploy"),
-                                        ("rules", "bt.tab_rules"))):
-            if ui.button((14 + i * 102, 60, 98, 26), tr(lab), active=(self.ltab == key), font="xs"):
+                                        ("rules", "bt.tab_rules"), ("mission", "bt.tab_mission"))):
+            if ui.button((14 + i * 76, 60, 72, 26), tr(lab), active=(self.ltab == key), font="xs"):
                 self.ltab = key
         if self.ltab == "terrain":
             self.draw_terrain_tab(ui, b)
         elif self.ltab == "deploy":
             self.draw_deploy_tab(ui, b)
+        elif self.ltab == "mission":
+            self.draw_mission_tab(ui, b)
         else:
             self.draw_rules_tab(ui, b)
 
@@ -3882,6 +4438,8 @@ class BattleView(View):
         sc, ox, oy = self.layout()
         title = tr("bt.title", w=b.W, h=b.H, fw=f"{b.W / 30:.0f}", fh=f"{b.H / 30:.0f}")
         title += f"  ·  {tr('deploy.' + b.deploy)}"
+        if b.mission:
+            title += f"  ·  {tr('ms.' + b.mission)}"
         if b.condition:
             title += f"  ·  {rname(b.condition)}"
         if b.context:
@@ -4071,6 +4629,73 @@ class BattleView(View):
                     n += 1
             b.last_msg = tr("rl.applied", n=n)
 
+    # ------------------------------ pestaña: misión ------------------------------
+    def draw_mission_tab(self, ui: UI, b: BattleState):
+        ui.text(tr("ms.title"), (18, 94), "xs", C_ACCENT)
+        for i, k in enumerate(MISSIONS):
+            if ui.button((16 + (i % 2) * 152, 110 + (i // 2) * 30, 148, 26), tr(f"ms.{k}"), active=(b.mission == k),
+                         font="xs", tip=tr(f"ms.{k}.d")):
+                b.set_mission(k)
+        if ui.button((16, 204, 148, 26), tr("ms.random"), font="xs"):
+            n = random.randint(1, 6)
+            b.set_mission(MISSIONS[n - 1])
+            b.last_msg = tr("ms.rolled", n=n, m=tr("ms." + b.mission))
+        if ui.button((168, 204, 148, 26), tr("ms.none"), font="xs"):
+            b.set_mission("")
+        y = 238
+        if b.mission:
+            ui.text(tr("ms.n", n=len(b.objectives)), (18, y), "xs", C_GOOD)
+            y += 16
+            for line in ui.wrap(tr(f"ms.{b.mission}.d"), "xs", 292)[:6]:
+                ui.text(line, (18, y), "xs", C_TEXT)
+                y += 14
+        if ui.button((16, 332, 300, 22), tr("ms.show", s=tr("on") if b.show_obj else tr("off")),
+                     active=b.show_obj, font="xs"):
+            b.show_obj = not b.show_obj
+
+        ui.text(tr("ev.title"), (18, 360), "xs", C_ACCENT)
+        for i, k in enumerate(EXTRAS):
+            if ui.button((16 + (i % 2) * 152, 376 + (i // 2) * 26, 148, 22), tr(f"ev.{k}"), active=(k in b.extras),
+                         font="xs", tip=tr(f"ev.{k}.d")):
+                if k in b.extras:
+                    b.extras.remove(k)
+                else:
+                    b.extras.append(k)
+        if ui.button((16, 454, 148, 22), tr("ev.roll"), font="xs"):
+            k = random.choice(EXTRAS)
+            b.extras = [k]
+            b.last_msg = tr("ev.rolled", e=tr(f"ev.{k}"))
+        if ui.button((168, 454, 148, 22), tr("ev.none"), font="xs"):
+            b.extras = []
+        if b.extras:
+            for i, line in enumerate(ui.wrap(tr(f"ev.{b.extras[0]}.d"), "xs", 292)[:2]):
+                ui.text(line, (18, 482 + i * 14), "xs", C_DIM)
+
+        ui.text(tr("sd.title"), (18, 516), "xs", C_ACCENT)
+        for row_y, attr, lab in ((532, "side_a", "sd.a"), (560, "side_b", "sd.b")):
+            cur = getattr(b, attr)
+            order = [""] + SIDES
+            name = tr("sd." + cur) if cur else tr("sd.none")
+            tip = (tr("sd." + cur + ".d") + "  —  " + tr("sd.reward", vp=SIDE_REWARD[cur][0], cr=SIDE_REWARD[cur][1],
+                                                         rr=SIDE_REWARD[cur][2])) if cur else tr("sd.tip")
+            if ui.button((16, row_y, 244, 24), tr(lab, s=name), active=bool(cur), font="xs", tip=tip):
+                setattr(b, attr, order[(order.index(cur) + 1) % len(order)])
+            if ui.button((264, row_y, 52, 24), "D6", font="xs", tip=tr("sd.tip")):
+                setattr(b, attr, random.choice(SIDES))
+        yy = 590
+        for attr, lab in (("side_a", "A"), ("side_b", "B")):
+            cur = getattr(b, attr)
+            if cur:
+                vp, cr_, rr_ = SIDE_REWARD[cur]
+                ui.text(ui.fit(f"{lab}: {tr('sd.' + cur + '.d')}", "xs", 296), (18, yy), "xs", C_TEXT)
+                ui.text(f"   {tr('sd.reward', vp=vp, cr=cr_, rr=rr_)}", (18, yy + 13), "xs", C_GOOD)
+                yy += 28
+        if b.briefing:
+            by = max(yy + 2, 640)
+            for i, line in enumerate(ui.wrap(b.briefing, "xs", 296)[:4]):
+                if by + i * 13 < 690:
+                    ui.text(line, (18, by + i * 13), "xs", C_WARN)
+
     # ------------------------------ franja inferior ------------------------------
     def draw_strip(self, ui: UI, b: BattleState):
         ui.panel((332, 600, 938, 94), tr("bt.editor"))
@@ -4182,10 +4807,13 @@ class FactionView(View):
                          font="xs", tip=tip):
                 camp.create_force(f)
                 self.app.set_status(tr("status.force_created", n=f.forces[-1].name, c=FORCE_COST_CR))
-            if ui.button((1030, y + 4, 100, 28), tr("fac.army"), color=(150, 100, 30), enabled=bool(f.forces),
+            if ui.button((1030, y + 4, 72, 28), tr("fac.army"), color=(150, 100, 30), enabled=bool(f.forces),
                          tip=tr("fac.army_tip")):
                 self.army_fid, self.army_fi, self.sel_unit, self.scroll, self.msg = f.fid, 0, None, 0, ""
-            if ui.button((1140, y + 4, 100, 28), tr("fac.delete"), enabled=len(camp.factions) > 1,
+            if ui.button((1106, y + 4, 46, 28), tr("fac.ai"), enabled=camp.solo, active=(camp.solo and f.ai),
+                         font="xs", tip=tr("fac.ai_tip")):
+                f.ai = not f.ai
+            if ui.button((1156, y + 4, 84, 28), tr("fac.delete"), enabled=len(camp.factions) > 1,
                          color=(110, 48, 48), font="xs"):
                 remove = f.fid
         if remove is not None:
@@ -4200,10 +4828,13 @@ class FactionView(View):
         camp.pts_per_rr = ui.stepper((490, by + 2, 118, 28), camp.pts_per_rr, 5, 200, 5)
         if ui.over((490, by + 2, 118, 28)):
             ui.tip = tr("fac.ptsrr_tip")
+        if ui.button((626, by, 120, 32), tr("camp.solo", s=tr("on") if camp.solo else tr("off")),
+                     active=camp.solo, tip=tr("camp.solo_tip"), font="xs"):
+            camp.set_solo(not camp.solo)
         if ui.button((920, by, 320, 32), tr("fac.end_turn"), color=(150, 100, 30),
                      tip=tr("fac.end_turn_tip")):
             camp.end_turn()
-            self.app.set_status(tr("status.turn_done", n=camp.turn - 1))
+            self.app.set_status(tr("status.ai_done" if camp.solo else "status.turn_done", n=camp.turn - 1))
 
         ui.panel((20, 478, 1240, 214), tr("fac.log"))
         for i, line in enumerate(reversed(camp.log[-9:])):
@@ -4522,6 +5153,10 @@ class FactionView(View):
         ui.text(tr("army.adv_done", t=adv_summary(u) or tr("army.adv_none")), (x, 520), "xs", C_TEXT)
         if ui.button((x, 542, 240, 26), tr("army.adv_undo"), enabled=bool(u.advances), font="xs"):
             undo_advance(u)
+        if ui.button((x + 248, 542, 300, 26), tr("hall.remove") if u.hall else tr("hall.add"), active=u.hall,
+                     font="xs", tip=tr("hall.rem_tip") if u.hall else tr("hall.add_tip")):
+            u.hall = not u.hall
+        ui.text(tr("hall.record", b=u.battles, s=u.survived, w=u.wins), (x, 574), "xs", C_DIM)
 
     # ---- botones comunes del editor ------------------------------------------
     def draw_unit_buttons(self, ui, fac, fi, fc, u):
@@ -4560,11 +5195,131 @@ class FactionView(View):
         self.scroll = clamp(self.scroll, max(0, pos - self.VISIBLE + 1), pos)
 
 
+class HallView(View):
+    """Galería de leyendas: unidades de rango máximo, las mejores en XP/victorias y las subidas a mano."""
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.fil = 0              # 0 = todas las facciones
+        self.sel_id: Optional[int] = None
+        self.scroll = 0
+        self.chr_scroll = 0
+
+    def draw(self, ui: UI):
+        camp = self.app.campaign
+        facs = camp.factions
+        self.fil = clamp(self.fil, 0, len(facs))
+        entries = camp.hall_entries()
+        if self.fil:
+            entries = [e for e in entries if e[0] is facs[self.fil - 1]]
+
+        L = pygame.Rect(20, 58, 520, 636)
+        ui.panel(L, tr("hall.title"))
+        fname = tr("hall.all") if self.fil == 0 else facs[self.fil - 1].name
+        if ui.button((32, 84, 300, 26), tr("hall.filter", f=fname), font="xs",
+                     color=facs[self.fil - 1].color if self.fil else None):
+            self.fil = (self.fil + 1) % (len(facs) + 1)
+        R = pygame.Rect(550, 58, 710, 636)
+        ui.panel(R)
+        if not entries:
+            for i, line in enumerate(ui.wrap(tr("hall.empty"), "s", 490)[:5]):
+                ui.text(line, (32, 130 + i * 20), "s", C_DIM)
+            ui.text(tr("hall.select"), (R.x + 16, R.y + 20), "s", C_DIM)
+            return
+
+        ids = [id(e[2]) for e in entries]
+        if self.sel_id not in ids:
+            self.sel_id, self.chr_scroll = ids[0], 0
+        vis = 16
+        if ui.over(L) and ui.wheel:
+            self.scroll -= ui.wheel * 2
+        self.scroll = clamp(self.scroll, 0, max(0, len(entries) - vis))
+        for k in range(self.scroll, min(len(entries), self.scroll + vis)):
+            f, fi, u, reason = entries[k]
+            row = pygame.Rect(30, 120 + (k - self.scroll) * 34, 500, 32)
+            on = id(u) == self.sel_id
+            pygame.draw.rect(ui.screen, (74, 62, 36) if on else (C_PANEL2 if ui.over(row) else (38, 42, 52)),
+                             row, border_radius=5)
+            pygame.draw.rect(ui.screen, f.color, (row.x, row.y, 6, row.h), border_radius=3)
+            dead = u.status == "destroyed"
+            tcol = (130, 132, 142) if dead else C_TEXT
+            star = {"legend": (240, 200, 70), "top": (190, 190, 205), "manual": (120, 200, 240)}[reason]
+            pygame.draw.polygon(ui.screen, star, [(row.x + 22, row.y + 8), (row.x + 28, row.y + 16),
+                                                  (row.x + 22, row.y + 24), (row.x + 16, row.y + 16)])
+            ui.text(ui.fit(u.title or u.name, "s", 280), (row.x + 38, row.y + 4), "s", tcol)
+            ui.text(ui.fit(u.name if u.title else (f.name), "xs", 280), (row.x + 38, row.y + 19), "xs", C_DIM)
+            ui.text(rank_name(rank_of(u.xp)), (row.x + 330, row.y + 4), "xs", C_ACCENT)
+            ui.text(f"{u.xp} XP · {u.wins}V", (row.right - 8, row.y + 18), "xs", C_DIM, "topright")
+            if ui.clicked(row) and not on:
+                self.sel_id, self.chr_scroll = id(u), 0
+
+        f, fi, u, reason = entries[ids.index(self.sel_id)]
+        fc = f.forces[fi]
+        x = R.x + 16
+        dead = u.status == "destroyed"
+        ui.text(ui.fit(u.title or u.name, "xl", 600), (x, R.y + 12), "xl", (130, 132, 142) if dead else C_ACCENT)
+        if dead:
+            ui.text(tr("hall.memorial"), (R.right - 16, R.y + 18), "m", C_BAD, "topright")
+        ui.text(ui.fit((u.name + " · " if u.title else "") + tr("hall.army", f=f.name, a=fc.army_name or fc.name),
+                       "s", 560), (x, R.y + 46), "s", C_DIM)
+        ui.text(tr("hall." + reason), (R.right - 16, R.y + 48), "xs", C_TEXT, "topright")
+        ui.text(tr("hall.rank", r=rank_name(rank_of(u.xp)), x=u.xp), (x, R.y + 68), "m", C_ACCENT)
+        ui.text(tr("hall.stats", q=u.quality, d=u.defense, s=u.size, p=u.pts, st=tr("st." + u.status)),
+                (x, R.y + 92), "s", C_TEXT)
+        ui.text(tr("hall.record", b=u.battles, s=u.survived, w=u.wins), (x, R.y + 112), "s", C_GOOD)
+        y = R.y + 136
+        adv = adv_summary(u)
+        if adv:
+            for line in ui.wrap(tr("hall.advances", t=adv), "xs", 676)[:2]:
+                ui.text(line, (x, y), "xs", C_TEXT)
+                y += 14
+        for label, txt in (("army.prev_rules", u.rules), ("army.prev_weapons", u.weapons),
+                           ("army.prev_upgrades", u.upgrades)):
+            if txt:
+                ui.text(ui.fit(tr(label, t=txt), "xs", 676), (x, y), "xs", C_DIM)
+                y += 14
+        y = max(y + 8, R.y + 214)
+        ui.text(tr("hall.title_lbl"), (x, y), "xs", C_DIM)
+        u.title = ui.text_field(f"hall_t_{id(u)}", (x, y + 14, 676, 28), u.title, 50)
+        if not u.title and not ui.focus:
+            ui.text(tr("hall.title_ph"), (x + 8, y + 28), "xs", (96, 102, 116), "midleft")
+        y += 50
+        ui.text(tr("hall.note_lbl"), (x, y), "xs", C_DIM)
+        u.legend_note = ui.text_field(f"hall_n_{id(u)}", (x, y + 14, 676, 28), u.legend_note, 300)
+        y += 48
+        for line in ui.wrap(u.legend_note, "xs", 676)[:3]:
+            ui.text(line, (x, y), "xs", C_TEXT)
+            y += 14
+        y = max(y + 6, R.y + 372)
+        ui.text(tr("hall.chronicle"), (x, y), "xs", C_ACCENT)
+        y += 18
+        chron = list(reversed(u.chronicle))
+        cvis = max(1, (R.bottom - 58 - y) // 22)
+        if not chron:
+            ui.text(tr("hall.no_chronicle"), (x, y + 2), "s", (120, 126, 140))
+        if ui.over((x, y, 676, cvis * 22)) and ui.wheel:
+            self.chr_scroll -= ui.wheel
+        self.chr_scroll = clamp(self.chr_scroll, 0, max(0, len(chron) - cvis))
+        for i in range(self.chr_scroll, min(len(chron), self.chr_scroll + cvis)):
+            e = chron[i]
+            res = {"win": "hall.win", "loss": "hall.loss"}.get(e.get("r"), "hall.draw")
+            col = {"win": C_GOOD, "loss": C_BAD}.get(e.get("r"), C_DIM)
+            row = pygame.Rect(x, y + (i - self.chr_scroll) * 22, 676, 20)
+            pygame.draw.rect(ui.screen, C_PANEL2, row, border_radius=3)
+            pygame.draw.rect(ui.screen, col, (row.x, row.y, 4, row.h), border_radius=2)
+            ui.text(ui.fit(tr("hall.chr_line", t=e.get("t", 0), q=e.get("q", "?"), r=tr(res), o=e.get("o", "?"),
+                              s=tr({"ok": "res.ok", "fallen": "res.fallen", "destroyed": "res.destroyed"}.get(
+                                  e.get("s"), "res.ok"))), "xs", 660), (row.x + 10, row.centery), "xs", C_TEXT, "midleft")
+        if ui.button((x, R.bottom - 44, 240, 30), tr("hall.remove"), enabled=u.hall, font="xs", tip=tr("hall.rem_tip")):
+            u.hall = False
+
+
 # =============================================================================
 #  APLICACIÓN
 # =============================================================================
 class App:
-    TAB_KEYS = [("tab.campaign", "campaign"), ("tab.battle", "battle"), ("tab.factions", "factions")]
+    TAB_KEYS = [("tab.campaign", "campaign"), ("tab.battle", "battle"), ("tab.factions", "factions"),
+                ("tab.hall", "hall")]
 
     def __init__(self):
         pygame.init()
@@ -4586,7 +5341,7 @@ class App:
         self.ui.mouse_fn = lambda: self.to_logical(pygame.mouse.get_pos())
         self.opr = OprDB()
         self.views = {"campaign": CampaignView(self), "battle": BattleView(self),
-                      "factions": FactionView(self)}
+                      "factions": FactionView(self), "hall": HallView(self)}
         self.tab = "campaign"
         self.status = ""
         self.status_err = False
@@ -4602,6 +5357,7 @@ class App:
         self.dlg_files: List[Tuple[str, float]] = []
         self.dlg_type = "GEN"
         self.dlg_base = ""
+        self.dlg_solo = False
         self.dlg_msg = ""
         self.dlg_scroll_open = 0
         self.dlg_scroll_saved = 0
@@ -4833,6 +5589,27 @@ class App:
         lb = camp.local_bonus(q)           # Torre vigía / Fortaleza: solo en este territorio
         if owner and (lb["ini"] or lb["df"]):
             b.context += tr("bt.local_bonus", ini=lb["ini"], df=lb["df"], f=owner.name)
+        # Modo solitario/coop: briefing con las fuerzas presentes y misión generada para jugar a la IA en mesa
+        clash = next((c for c in camp.clashes if (c.col, c.row) == (q.col, q.row)), None)
+        fids = [g.fid for g, _i, _c in camp.forces_at(q.col, q.row)]
+        if clash:
+            fids = [clash.att_fid, clash.def_fid] + [i for i in fids if i not in (clash.att_fid, clash.def_fid)]
+        sides = [camp.faction(i) for i in dict.fromkeys(fids)][:2]
+        ais = [g for g in sides if g is not None and camp.is_ai(g)]
+        b.solo = bool(camp.solo and ais)
+        b.briefing = ""
+        if b.solo:
+            if not b.mission:
+                b.set_mission(random.choice(MISSIONS))
+            parts = []
+            for g in sides:
+                us = camp.participants(q, g, None)
+                parts.append((g.name, len(us), sum(u.pts for u in us)))
+            b.briefing = tr("bt.solo_note")
+            if len(parts) == 2:
+                b.briefing += "  " + tr("bt.brief_forces", a=parts[0][0], ua=parts[0][1], pa=parts[0][2],
+                                        d=parts[1][0], ud=parts[1][1], pd=parts[1][2])
+            b.context += tr("bt.ctx_solo", f=ais[0].name)
         b.generate(False)
         self.switch_tab("battle")
         self.set_status(tr("status.battle_ready"))
@@ -4902,7 +5679,14 @@ class App:
         for i, (w, lab) in enumerate((("att", "res.win_att"), ("draw", "res.win_draw"), ("def", "res.win_def"))):
             if ui.button((box.x + 560 + i * 162, box.y + 34, 156, 28), tr(lab), active=(r["winner"] == w), font="xs"):
                 r["winner"] = w
-        ui.text(tr("res.xp_hint"), (box.x + 14, box.y + 68), "xs", C_DIM)
+        ui.text(ui.fit(tr("res.xp_hint"), "xs", 500), (box.x + 14, box.y + 68), "xs", C_DIM)
+        bt = self.battle
+        if bt.side_a and ui.button((box.x + 520, box.y + 64, 250, 22), tr("res.sec_a"), active=r.get("sec_a", False),
+                                   font="xs", tip=tr("sd." + bt.side_a + ".d")):
+            r["sec_a"] = not r.get("sec_a", False)
+        if bt.side_b and ui.button((box.x + 776, box.y + 64, 270, 22), tr("res.sec_b"), active=r.get("sec_d", False),
+                                   font="xs", tip=tr("sd." + bt.side_b + ".d")):
+            r["sec_d"] = not r.get("sec_d", False)
 
         state_col = {"ok": None, "fallen": (170, 110, 40), "destroyed": (130, 50, 50)}
         state_lab = {"ok": "res.ok", "fallen": "res.fallen", "destroyed": "res.destroyed"}
@@ -4945,7 +5729,19 @@ class App:
             clash = r["clash"] if (r["clash"] and (r["clash"].att_fid, r["clash"].def_fid) == (r["att"], r["dfn"])) else None
             att_rows = [(d["unit"], d["state"], d["xp"]) for d in r["rows"]["att"]]
             def_rows = [(d["unit"], d["state"], d["xp"]) for d in r["rows"]["def"]]
-            msgs = camp.record_battle(q, r["att"], r["dfn"], r["winner"], att_rows, def_rows, r["note"], clash)
+            bt = self.battle
+            msgs = camp.record_battle(q, r["att"], r["dfn"], r["winner"], att_rows, def_rows, r["note"], clash,
+                                      bt.mission)
+            rewards = []
+            for flag, key, fid in ((r.get("sec_a"), bt.side_a, r["att"]), (r.get("sec_d"), bt.side_b, r["dfn"])):
+                fx = camp.faction(fid)
+                if flag and key and fx is not None:      # las misiones secundarias dan recursos extra
+                    vp, cr_, rr_ = SIDE_REWARD[key]
+                    fx.cr += cr_
+                    fx.rr += rr_
+                    rewards.append(f"{fx.name}: {tr('sd.reward', vp=vp, cr=cr_, rr=rr_)}")
+            if rewards:
+                msgs = list(msgs) + [tr("res.rewards", t="; ".join(rewards)).strip()]
             self.set_status(tr("status.recorded", q=quad_label(q.col, q.row)) + ("  " + " ".join(msgs) if msgs else ""))
             self.dialog = None
             ui.focus = None
@@ -5177,11 +5973,11 @@ class App:
         pygame.draw.line(self.screen, C_LINE, (0, TOPBAR_H - 1), (WIN_W, TOPBAR_H - 1))
         ui.text("OPR Manager", (16, 12), "l", C_ACCENT)
         for i, (key, tab) in enumerate(self.TAB_KEYS):
-            if ui.button((190 + i * 200, 8, 196, 32), tr(key), active=(self.tab == tab)):
+            if ui.button((190 + i * 154, 8, 150, 32), tr(key), active=(self.tab == tab)):
                 self.switch_tab(tab)
         n = len(self.slots)
         label = self.campaign.name + (f"  ({self.active + 1}/{n})" if n > 1 else "")
-        if ui.button((800, 8, 200, 32), label, tip=tr("top.files_tip"), font="xs"):
+        if ui.button((812, 8, 188, 32), label, tip=tr("top.files_tip"), font="xs"):
             self.open_files()
         for i, lang in enumerate(LANGS):
             if ui.button((1008 + i * 40, 8, 36, 32), lang.upper(), active=(LANG == lang),
@@ -5199,7 +5995,7 @@ class App:
                     C_BAD if self.status_err else C_GOOD, "midleft")
         else:
             ui.text(tr("status.hint"), (12, r.centery), "xs", C_DIM, "midleft")
-        ui.text("OPR Campaign & Battle Manager v5", (WIN_W - 12, r.centery), "xs", C_DIM, "midright")
+        ui.text("OPR Campaign & Battle Manager v6", (WIN_W - 12, r.centery), "xs", C_DIM, "midright")
 
     def draw_files_dialog(self, ui: UI):
         dim = pygame.Surface((WIN_W, WIN_H), pygame.SRCALPHA)
@@ -5220,7 +6016,7 @@ class App:
             if any(s["campaign"].name == composed for s in self.slots):
                 self.dlg_msg = tr("dlg.name_exists")
             else:
-                camp = Campaign(self.dlg_type, self.dlg_base)
+                camp = Campaign(self.dlg_type, self.dlg_base, solo=self.dlg_solo)
                 self.activate(self.add_slot(camp, BattleState(), None))
                 self.set_status(tr("status.created", n=camp.name))
                 self.dialog = None
@@ -5246,10 +6042,13 @@ class App:
                 self.refresh_files()
                 self.set_status(tr("status.renamed", n=self.campaign.name))
                 self.dlg_msg = ""
-        ui.text(("-> " + composed) if composed else tr("dlg.name_empty"), (x, box.y + 88), "xs",
-                C_GOOD if composed else C_WARN)
+        ui.text(ui.fit(("-> " + composed) if composed else tr("dlg.name_empty"), "xs", 320), (x, box.y + 90),
+                "xs", C_GOOD if composed else C_WARN)
+        if ui.button((x + 560, box.y + 84, 176, 24), tr("dlg.solo", s=tr("on") if self.dlg_solo else tr("off")),
+                     active=self.dlg_solo, font="xs", tip=tr("dlg.solo_tip")):
+            self.dlg_solo = not self.dlg_solo
         if self.dlg_msg:
-            ui.text(self.dlg_msg, (x + 400, box.y + 88), "xs", C_BAD)
+            ui.text(ui.fit(self.dlg_msg, "xs", 210), (x + 330, box.y + 90), "xs", C_BAD)
 
         # --- campañas abiertas
         n = len(self.slots)
@@ -5346,8 +6145,8 @@ class App:
                         if ctrl and e.key == pygame.K_l:
                             self.open_files()
                             continue
-                        if not ctrl and not self.dialog and e.key in (pygame.K_1, pygame.K_2, pygame.K_3):
-                            self.switch_tab(("campaign", "battle", "factions")[e.key - pygame.K_1])
+                        if not ctrl and not self.dialog and e.key in (pygame.K_1, pygame.K_2, pygame.K_3, pygame.K_4):
+                            self.switch_tab(("campaign", "battle", "factions", "hall")[e.key - pygame.K_1])
                 if self.dialog:
                     continue
                 if e.type in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP,
