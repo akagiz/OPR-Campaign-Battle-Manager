@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 ===============================================================================
- OPR Campaign & Battle Manager  v6
+ OPR Campaign & Battle Manager  v7
  Gestor de campañas y tableros para One Page Rules / for One Page Rules
 ===============================================================================
  Requisitos / Requirements : Python 3.8+  and  pygame 2.x  (pip install pygame)
@@ -25,6 +25,8 @@
      · v6: misiones/objetivos/eventos/secundarias en el generador de batalla, Cuartel
        reequilibrado, terrenos de campaña con efectos (impasable, estéril, bonos, nexo),
        modo solitario con IA y pestaña «Hall of Fame» de unidades destacadas.
+     · v7: aviso de nueva versión (GitHub), resolución rápida de batallas, objetivos arrastrables,
+       cicatrices de guerra, pestaña de estadísticas y hoja de batalla imprimible (PDF/PNG).
  EN  · Tabs: 1 Campaign map · 2 Battle generator · 3 Factions/Resources
      · F11: fullscreen · ES/EN buttons: language · Ctrl+S: save
      · Ctrl+L: campaign files ("campaign/" folder)
@@ -44,12 +46,15 @@ import math
 import os
 import random
 import re
+import shutil
 import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
 from dataclasses import dataclass, field, asdict, fields
 from typing import Dict, List, Optional, Tuple
 
@@ -58,6 +63,13 @@ import pygame
 # =============================================================================
 #  CONSTANTES GENERALES
 # =============================================================================
+APP_VERSION = "7.0.0"                    # versión de este script (se compara con GitHub)
+GITHUB_REPO = "akagiz/OPR-Campaign-Battle-Manager"
+REPO_URL = f"https://github.com/{GITHUB_REPO}"
+GITHUB_API = f"https://api.github.com/repos/{GITHUB_REPO}"
+GITHUB_RAW = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main"
+SCRIPT_NAME = "opr_campaign_manager.py"
+
 WIN_W, WIN_H = 1280, 720
 FPS = 60
 TOPBAR_H = 48
@@ -67,6 +79,11 @@ try:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 except NameError:  # intérprete interactivo
     BASE_DIR = os.getcwd()
+try:
+    SCRIPT_PATH = os.path.abspath(__file__)
+except NameError:
+    SCRIPT_PATH = ""
+UPDATES_DIR = os.path.join(BASE_DIR, "updates")        # descargas del actualizador
 CAMPAIGN_DIR = os.path.join(BASE_DIR, "campaign")      # partidas guardadas
 EXPORT_DIR = os.path.join(BASE_DIR, "exports")         # exportaciones de batalla
 SETTINGS_FILE = os.path.join(BASE_DIR, "opr_settings.json")
@@ -83,6 +100,19 @@ ROUTE_COST_CR = 5           # construir una ruta entre dos territorios propios
 UPKEEP_PTS_PER_CR = 200     # mantenimiento: ceil(puntos / 200) CR por unidad activa y turno
 RECRUIT_BUILDINGS = ("barracks", "fortress")   # edificios que permiten reclutar
 STATUSES = ("active", "reserve", "fallen", "destroyed")
+QUICK_RANDOM = 0.15         # variación aleatoria (±) de la resolución rápida
+
+# Cicatrices de guerra (reglas orientativas inspiradas en el modo campaña de OPR).
+#   turns = turnos de duración (0 = permanente); q/d = pasos que empeora calidad/defensa;
+#   mv = pulgadas de movimiento perdidas; at = ataques perdidos; morale = penalización a moral.
+SCARS: Dict[str, dict] = {
+    "eye": dict(turns=3, q=1),
+    "limp": dict(turns=2, mv=1),
+    "arm": dict(turns=3, at=1),
+    "trauma": dict(turns=2, morale=1),
+    "armor": dict(turns=3, d=1),
+    "maim": dict(turns=0, mv=1),
+}
 
 # Paleta de la interfaz
 C_BG = (22, 25, 31)
@@ -1174,6 +1204,153 @@ T.update({
 })
 
 
+
+T.update({
+    # --- pestañas ---
+    "tab.stats": ("5 · Estadísticas", "5 · Statistics"),
+    "status.hint": ("1-5: pestañas · F11: pantalla completa · Ctrl+S: guardar · Ctrl+L: campañas",
+                    "1-5: tabs · F11: fullscreen · Ctrl+S: save · Ctrl+L: campaigns"),
+    "camp.record": ("Registrar", "Record"),
+    "camp.quick": ("Resolver rápido", "Quick resolve"),
+    # --- actualizador ---
+    "upd.title": ("NUEVA VERSIÓN DISPONIBLE", "NEW VERSION AVAILABLE"),
+    "upd.body": ("Hay una versión más reciente: {new} (tienes la {cur}).",
+                 "A newer version is available: {new} (you have {cur})."),
+    "upd.src_release": ("Origen: última release de GitHub.", "Source: latest GitHub release."),
+    "upd.src_main": ("Origen: rama principal de GitHub.", "Source: GitHub main branch."),
+    "upd.notes": ("Novedades:", "What's new:"),
+    "upd.download": ("Actualizar y descargar ahora", "Update and download now"),
+    "upd.downloading": ("Descargando...", "Downloading..."),
+    "upd.done": ("Descargada y verificada: {p}", "Downloaded and verified: {p}"),
+    "upd.install": ("Instalar y reiniciar", "Install and restart"),
+    "upd.install_tip": ("Guarda una copia (.bak) del script actual, lo sustituye por el nuevo y reinicia.",
+                        "Keeps a backup (.bak) of the current script, replaces it with the new one and restarts."),
+    "upd.skip": ("Continuar con la versión actual", "Continue with the current version"),
+    "upd.failed": ("No se pudo descargar: {err}", "Download failed: {err}"),
+    "upd.install_failed": ("No se pudo instalar: {err}", "Installation failed: {err}"),
+    "upd.manual": ("Descarga manual: {u}", "Manual download: {u}"),
+    "upd.frozen": ("Ejecutas un programa empaquetado: instala a mano la versión descargada.",
+                   "You are running a packaged program: install the downloaded version by hand."),
+    # --- objetivos arrastrables ---
+    "ms.reset": ("Restablecer", "Reset"),
+    "ms.reset_tip": ("Vuelve a la plantilla simétrica de la misión.", "Goes back to the mission's symmetric template."),
+    "ms.drag_hint": ("Arrastra los marcadores sobre el tablero para colocarlos a mano.",
+                     "Drag the markers on the board to place them by hand."),
+    # --- resolución rápida ---
+    "qr.btn": ("Resolución rápida", "Quick resolve"),
+    "qr.btn_tip": ("Resuelve automáticamente el combate de este territorio, sin tablero: puntos, terreno, fortificaciones y azar.",
+                   "Automatically resolves this territory's combat without a table: points, terrain, fortifications and luck."),
+    "qr.title": ("RESOLUCIÓN RÁPIDA · {q}", "QUICK RESOLVE · {q}"),
+    "qr.units": ("{n} unidades activas", "{n} active units"),
+    "qr.base": ("Puntos base: {v:.0f}", "Base points: {v:.0f}"),
+    "qr.terrain": ("Terreno y fortificaciones: {v:+.0f}%", "Terrain and fortifications: {v:+.0f}%"),
+    "qr.faction": ("Bono de facción (rango): {v:+.0f}%", "Faction bonus (rank): {v:+.0f}%"),
+    "qr.morale": ("Moral y mantenimiento: {v:+.0f}%", "Morale and upkeep: {v:+.0f}%"),
+    "qr.total": ("Fuerza total: {v:.0f}", "Total strength: {v:.0f}"),
+    "qr.random": ("Azar controlado: ±{p}% por bando.", "Controlled luck: ±{p}% per side."),
+    "qr.resolve": ("Resolver", "Resolve"),
+    "qr.cancel": ("Cancelar", "Cancel"),
+    "qr.close": ("Cerrar", "Close"),
+    "qr.note": ("Resolución rápida", "Quick resolve"),
+    "qr.winner": ("Resultado: {w}", "Result: {w}"),
+    "qr.rolls": ("Tiradas: {a:.0f} (x{ra:.2f}) contra {d:.0f} (x{rd:.2f})", "Rolls: {a:.0f} (x{ra:.2f}) against {d:.0f} (x{rd:.2f})"),
+    "qr.losses": ("{n}: {l} bajas ({d} destruidas), XP repartida {x}", "{n}: {l} casualties ({d} destroyed), XP awarded {x}"),
+    "qr.scars": ("Cicatrices: {t}", "Scars: {t}"),
+    "qr.no_scars": ("Ninguna cicatriz nueva.", "No new scars."),
+    "qr.no_sides": ("Elige dos facciones distintas.", "Pick two different factions."),
+    # --- cicatrices de guerra ---
+    "army.tab_scar": ("Cicatrices", "Scars"),
+    "army.prev_scar": ("Cicatrices: {t}", "Scars: {t}"),
+    "hall.scars": ("Cicatrices: {t}", "Scars: {t}"),
+    "scar.eye": ("Ojo dañado", "Damaged eye"),
+    "scar.eye.d": ("Calidad un paso peor mientras dure.", "Quality one step worse while it lasts."),
+    "scar.limp": ("Cojera", "Limp"),
+    "scar.limp.d": ("-1'' de movimiento mientras dure.", "-1'' movement while it lasts."),
+    "scar.arm": ("Brazo herido", "Wounded arm"),
+    "scar.arm.d": ("-1 ataque en el arma principal mientras dure.", "-1 attack on the main weapon while it lasts."),
+    "scar.trauma": ("Trauma de guerra", "War trauma"),
+    "scar.trauma.d": ("-1 a las tiradas de moral mientras dure.", "-1 to morale rolls while it lasts."),
+    "scar.armor": ("Armadura dañada", "Damaged armor"),
+    "scar.armor.d": ("Defensa un paso peor mientras dure.", "Defense one step worse while it lasts."),
+    "scar.maim": ("Mutilación", "Maiming"),
+    "scar.maim.d": ("Permanente: -1'' de movimiento.", "Permanent: -1'' movement."),
+    "scar.turns": ("{n} turnos", "{n} turns"),
+    "scar.perm": ("permanente", "permanent"),
+    "scar.eff": ("Efectos: {t}", "Effects: {t}"),
+    "scar.none": ("Sin cicatrices activas.", "No active scars."),
+    "scar.none_list": ("- sin cicatrices -", "- no scars -"),
+    "scar.none_short": ("Ninguna", "None"),
+    "scar.current": ("CICATRICES DE GUERRA", "WAR SCARS"),
+    "scar.add_title": ("Añadir una cicatriz manualmente", "Add a scar manually"),
+    "scar.heal": ("Curar", "Heal"),
+    "scar.heal_tip": ("Elimina la cicatriz.", "Removes the scar."),
+    "scar.added": ("{u} sufre «{s}».", "{u} suffers \"{s}\"."),
+    "scar.note": ("Las temporales se curan con los turnos (el doble de rápido en un Hospital propio). Reglas orientativas inspiradas en el modo campaña de OPR.",
+                  "Temporary scars heal over turns (twice as fast in an own Hospital). Indicative rules inspired by OPR's campaign mode."),
+    "scar.m_q": ("Calidad {a}+ -> {b}+", "Quality {a}+ -> {b}+"),
+    "scar.m_d": ("Defensa {a}+ -> {b}+", "Defense {a}+ -> {b}+"),
+    "scar.m_mv": ("Mov. -{n}''", "Move -{n}''"),
+    "scar.m_at": ("Ataque -{n}", "Attack -{n}"),
+    "scar.m_morale": ("Moral -{n}", "Morale -{n}"),
+    "res.scar_hdr": ("Cicatriz", "Scar"),
+    "res.scar_auto": ("Auto", "Auto"),
+    "res.scar_tip": ("Auto: tirada según el estado (caída 45%, superviviente del bando perdedor 12%). Clic para fijar una o ninguna.",
+                     "Auto: roll based on status (fallen 45%, survivor on the losing side 12%). Click to pick one or none."),
+    "log.scar": ("{u}: cicatriz «{s}».", "{u}: scar \"{s}\"."),
+    # --- estadísticas ---
+    "stats.chart_title": ("EVOLUCIÓN POR TURNO", "EVOLUTION PER TURN"),
+    "stats.m_vp": ("Puntos de victoria", "Victory points"),
+    "stats.m_terr": ("Territorios", "Territories"),
+    "stats.m_pts": ("Puntos activos", "Active points"),
+    "stats.axis": ("Turno", "Turn"),
+    "stats.no_data": ("Aún hay pocos datos: finaliza algún turno.", "Little data yet: end a turn or two."),
+    "stats.summary": ("RESUMEN DE CAMPAÑA", "CAMPAIGN SUMMARY"),
+    "stats.turn": ("Turno actual: {n}", "Current turn: {n}"),
+    "stats.battles": ("Batallas libradas: {n}", "Battles fought: {n}"),
+    "stats.leader": ("Líder en VP: {f} ({v})", "VP leader: {f} ({v})"),
+    "stats.top_inflicted": ("Más bajas infligidas: {f} ({n})", "Most casualties inflicted: {f} ({n})"),
+    "stats.top_suffered": ("Más bajas sufridas: {f} ({n})", "Most casualties suffered: {f} ({n})"),
+    "stats.top_disputed": ("Territorio más disputado: {q} ({n} combates)", "Most contested territory: {q} ({n} battles)"),
+    "stats.none": ("ninguno todavía", "none yet"),
+    "stats.vp_def": ("VP = territorios + edificios/2 + 2 por victoria.", "VP = territories + buildings/2 + 2 per victory."),
+    "stats.table": ("ESTADÍSTICAS POR FACCIÓN", "FACTION STATISTICS"),
+    "stats.h_fac": ("Facción", "Faction"),
+    "stats.h_terr": ("Terr.", "Terr."),
+    "stats.h_vp": ("VP", "VP"),
+    "stats.h_won": ("Vict.", "Wins"),
+    "stats.h_lost": ("Derr.", "Loss"),
+    "stats.h_draw": ("Emp.", "Draw"),
+    "stats.h_inf": ("Infl.", "Infl."),
+    "stats.h_suf": ("Sufr.", "Suff."),
+    "stats.h_des": ("Destr.", "Destr."),
+    "stats.disputed": ("TERRITORIOS MÁS DISPUTADOS", "MOST CONTESTED TERRITORIES"),
+    "stats.no_battles": ("Aún no hay batallas registradas.", "No battles recorded yet."),
+    # --- hoja de batalla ---
+    "rep.btn": ("Hoja de batalla", "Battle sheet"),
+    "rep.btn_tip": ("Exporta una hoja imprimible (PDF y PNG) con el tablero, la misión, las secundarias y los ejércitos.",
+                    "Exports a printable sheet (PDF and PNG) with the board, mission, side missions and armies."),
+    "rep.saved": ("Hoja guardada: {f}", "Sheet saved: {f}"),
+    "rep.saved_path": ("Hoja de batalla (PDF y PNG) guardada en {path}", "Battle sheet (PDF and PNG) saved in {path}"),
+    "rep.title": ("HOJA DE BATALLA", "BATTLE SHEET"),
+    "rep.board": ("Tablero {w} x {h} cm", "Board {w} x {h} cm"),
+    "rep.mission": ("MISIÓN PRINCIPAL", "MAIN MISSION"),
+    "rep.events": ("EVENTOS DE MISIÓN", "MISSION EVENTS"),
+    "rep.deploy": ("DESPLIEGUE Y CONDICIONES", "DEPLOYMENT AND CONDITIONS"),
+    "rep.sides": ("MISIONES SECUNDARIAS", "SIDE MISSIONS"),
+    "rep.armies": ("EJÉRCITOS ENFRENTADOS", "OPPOSING ARMIES"),
+    "rep.none": ("- ninguna -", "- none -"),
+    "rep.player": ("Jugador {l}", "Player {l}"),
+    "rep.objectives": ("{n} marcadores de objetivo", "{n} objective markers"),
+    "rep.depth": ("Profundidad de zona: {d} cm", "Zone depth: {d} cm"),
+    "rep.cond": ("Condición: {c}", "Condition: {c}"),
+    "rep.total": ("Total: {p} pts", "Total: {p} pts"),
+    "rep.more": ("+{n} unidades más", "+{n} more units"),
+    "rep.h_unit": ("Unidad", "Unit"),
+    "rep.h_state": ("Estado", "Status"),
+    "rep.footer": ("OPR Campaign & Battle Manager v{v} · {d}", "OPR Campaign & Battle Manager v{v} · {d}"),
+})
+
+
 def tr(key: str, **kw) -> str:
     v = T.get(key)
     if v is None:
@@ -1364,6 +1541,7 @@ class ArmyUnit:
     title: str = ""             # título honorífico (Hall of Fame)
     legend_note: str = ""       # nota narrativa del jugador
     hall: bool = False          # subida manual a la galería
+    scars: List[dict] = field(default_factory=list)   # [{k, t}] cicatrices (t = turnos restantes, 0 = permanente)
 
 
 def default_rr(pts: int, pts_per_rr: int) -> int:
@@ -1441,6 +1619,61 @@ def undo_advance(u: "ArmyUnit") -> bool:
         parts = [p for p in _split_top(u.rules) if p.lower() != ADV_RULES[key].lower()]
         u.rules = ", ".join(parts)
     return True
+
+
+def roll_scar(rng=None) -> str:
+    return (rng or random).choice(list(SCARS))
+
+
+def add_scar(u: "ArmyUnit", key: str) -> bool:
+    """Añade (o renueva) una cicatriz. Devuelve True si es nueva."""
+    if key not in SCARS:
+        return False
+    for s in u.scars:
+        if s["k"] == key:
+            s["t"] = SCARS[key]["turns"]
+            return False
+    u.scars.append(dict(k=key, t=SCARS[key]["turns"]))
+    return True
+
+
+def scar_mods(u: "ArmyUnit") -> dict:
+    d = dict(q=0, d=0, mv=0, at=0, morale=0)
+    for s in u.scars:
+        for k, v in SCARS.get(s["k"], {}).items():
+            if k in d:
+                d[k] += v
+    return d
+
+
+def eff_quality(u: "ArmyUnit") -> int:
+    return min(6, u.quality + scar_mods(u)["q"])
+
+
+def eff_defense(u: "ArmyUnit") -> int:
+    return min(6, u.defense + scar_mods(u)["d"])
+
+
+def scar_effects(u: "ArmyUnit") -> str:
+    """Resumen de los efectos activos de las cicatrices sobre la ficha de la unidad."""
+    m = scar_mods(u)
+    parts = []
+    if m["q"]:
+        parts.append(tr("scar.m_q", a=u.quality, b=eff_quality(u)))
+    if m["d"]:
+        parts.append(tr("scar.m_d", a=u.defense, b=eff_defense(u)))
+    if m["mv"]:
+        parts.append(tr("scar.m_mv", n=m["mv"]))
+    if m["at"]:
+        parts.append(tr("scar.m_at", n=m["at"]))
+    if m["morale"]:
+        parts.append(tr("scar.m_morale", n=m["morale"]))
+    return ", ".join(parts)
+
+
+def scar_summary(u: "ArmyUnit") -> str:
+    return ", ".join(tr("scar." + s["k"]) + (f" ({tr('scar.turns', n=s['t'])})" if s["t"] else f" ({tr('scar.perm')})")
+                     for s in u.scars if s["k"] in SCARS)
 
 
 def adv_summary(u: "ArmyUnit") -> str:
@@ -1804,6 +2037,105 @@ class ArmyFetcher:
         r, e = self.result, self.error
         self.result = self.error = None
         return r, e
+
+
+# =============================================================================
+#  ACTUALIZADOR (GitHub): comprobación asíncrona al inicio, descarga verificada e instalación
+# =============================================================================
+def version_tuple(s) -> tuple:
+    nums = re.findall(r"\d+", str(s))
+    return tuple(int(x) for x in nums[:4]) or (0,)
+
+
+def _http_text(url: str, timeout: int = 10, limit: Optional[int] = None,
+               accept: str = "application/vnd.github+json") -> str:
+    req = urllib.request.Request(url, headers={"User-Agent": "OPR-Campaign-Manager/" + APP_VERSION,
+                                               "Accept": accept})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        raw = r.read(limit) if limit else r.read()
+    return raw.decode("utf-8", "replace")
+
+
+class UpdateChecker:
+    """
+    Consulta GitHub en un hilo (nunca bloquea ni rompe el juego si no hay red):
+      1) API de releases (última release y su asset .py si lo hay);
+      2) si no hay release, lee APP_VERSION del script de la rama principal.
+    """
+
+    def __init__(self):
+        self.done = False
+        self.info: Optional[dict] = None          # {version, url, notes, download, source}
+        self.error = ""
+        self.dl_busy = False
+        self.dl_path = ""
+        self.dl_error = ""
+        self.handled = False
+
+    def start(self):
+        threading.Thread(target=self._check, daemon=True).start()
+
+    def _check(self):
+        try:
+            info = None
+            try:
+                data = json.loads(_http_text(f"{GITHUB_API}/releases/latest"))
+                tag = str(data.get("tag_name") or data.get("name") or "")
+                if version_tuple(tag) != (0,):
+                    py = next((a.get("browser_download_url") for a in data.get("assets") or []
+                               if str(a.get("name", "")).endswith(".py")), None)
+                    info = dict(version=tag.lstrip("vV"), url=data.get("html_url") or REPO_URL,
+                                notes=str(data.get("body") or "")[:700],
+                                download=py or f"{GITHUB_RAW}/{SCRIPT_NAME}", source="release")
+            except Exception:
+                info = None
+            if info is None:
+                head = _http_text(f"{GITHUB_RAW}/{SCRIPT_NAME}", limit=40000, accept="text/plain")
+                m = re.search(r'APP_VERSION\s*=\s*"([^"]+)"', head)
+                if m:
+                    info = dict(version=m.group(1), url=REPO_URL, notes="",
+                                download=f"{GITHUB_RAW}/{SCRIPT_NAME}", source="main")
+            if info and version_tuple(info["version"]) > version_tuple(APP_VERSION):
+                self.info = info
+        except Exception as ex:  # noqa  (sin red, límite de la API, repositorio privado...)
+            self.error = str(ex)[:80]
+        finally:
+            self.done = True
+
+    def download(self):
+        if self.dl_busy or not self.info:
+            return
+        self.dl_busy, self.dl_error, self.dl_path = True, "", ""
+        threading.Thread(target=self._download, daemon=True).start()
+
+    def _download(self):
+        try:
+            text = _http_text(self.info["download"], timeout=60, accept="text/plain")
+            compile(text, "update", "exec")                      # debe ser Python válido
+            if "APP_VERSION" not in text or "class App" not in text:
+                raise ValueError("unexpected file")
+            os.makedirs(UPDATES_DIR, exist_ok=True)
+            path = os.path.join(UPDATES_DIR, f"opr_campaign_manager_v{self.info['version']}.py")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(text)
+            self.dl_path = path
+        except Exception as ex:  # noqa
+            self.dl_error = str(ex)[:90]
+        finally:
+            self.dl_busy = False
+
+    @staticmethod
+    def can_install() -> bool:
+        return bool(SCRIPT_PATH) and os.path.isfile(SCRIPT_PATH) and not getattr(sys, "frozen", False)
+
+    def install(self) -> Optional[str]:
+        """Sustituye el script actual por el descargado (con copia .bak). Devuelve un error o None."""
+        try:
+            shutil.copyfile(SCRIPT_PATH, SCRIPT_PATH + ".bak")
+            shutil.copyfile(self.dl_path, SCRIPT_PATH)
+            return None
+        except Exception as ex:  # noqa
+            return str(ex)[:90]
 
 
 # =============================================================================
@@ -2174,6 +2506,7 @@ class Campaign:
         self.routes: List[List[int]] = []       # [c1, r1, c2, r2, fid]
         self.clashes: List[Clash] = []
         self.log: List[str] = []
+        self.stats_history: List[dict] = []     # instantáneas por turno (gráficos de estadísticas)
         self.add_faction()
         self.add_faction()
         self.generate(5)
@@ -2408,6 +2741,8 @@ class Campaign:
         self.clashes = []
         self.turn = 1
         self.log = [tr("log.newmap", n=self.cols, seed=self.seed)]
+        self.stats_history = []
+        self.snapshot()
 
     def _ensure_connected(self, rng):
         """Las zonas impasables nunca deben partir el mapa: si lo hacen, se convierten en colinas."""
@@ -2647,7 +2982,9 @@ class Campaign:
         def apply(rows, side: str, other: str) -> Tuple[int, int]:
             res = "draw" if winner == "draw" else ("win" if winner == side else "loss")
             lost = destroyed = 0
-            for u, state, xp in rows:
+            for row in rows:
+                u, state, xp = row[0], row[1], row[2]
+                scar = row[3] if len(row) > 3 else ""
                 if state in ("fallen", "destroyed"):
                     u.status = state
                     lost += 1
@@ -2663,6 +3000,9 @@ class Campaign:
                 u.xp += xp
                 if rank_of(u.xp) > before:
                     msgs.append(tr("log.rankup", u=u.name, r=rank_name(rank_of(u.xp))))
+                if scar and state != "destroyed":
+                    add_scar(u, scar)
+                    msgs.append(tr("log.scar", u=u.name, s=tr("scar." + scar)))
             return lost, destroyed
 
         la, da = apply(att_rows, "att", def_name)
@@ -2729,6 +3069,18 @@ class Campaign:
     def end_turn(self):
         if self.solo:
             self.ai_turn()                       # las facciones IA reclutan, construyen y se mueven
+        # 0) Cicatrices temporales: se curan con los turnos (el doble de rápido en un Hospital propio)
+        for f in self.factions:
+            for fc in f.forces:
+                at_q = self.quad(fc.col, fc.row)
+                step = 2 if (at_q.owner == f.fid and "hospital" in at_q.buildings) else 1
+                for u in fc.units:
+                    for s in u.scars:
+                        if s["t"] > 0:
+                            s["t"] = max(0, s["t"] - step)
+                            if s["t"] == 0:
+                                s["t"] = -1                  # marca de curada
+                    u.scars = [s for s in u.scars if s["t"] != -1]
         # 1) Hospitales: solo recuperan caídas de los ejércitos del dueño presentes en el territorio
         for q in self.quads:
             owner = self.faction(q.owner)
@@ -2779,13 +3131,14 @@ class Campaign:
         self.prune_routes()
         self.turn += 1
         self.log = self.log[-60:]
+        self.snapshot()
 
     # ---- persistencia -----------------------------------------------------
     def to_dict(self) -> dict:
         return dict(name=self.name, system=self.system, cols=self.cols, rows=self.rows,
                     seed=self.seed, turn=self.turn, next_fid=self.next_fid, log=self.log[-60:],
                     max_buildings=self.max_buildings, pts_per_rr=self.pts_per_rr,
-                    logistics=self.logistics, solo=self.solo, routes=self.routes,
+                    logistics=self.logistics, solo=self.solo, stats_history=self.stats_history, routes=self.routes,
                     clashes=[asdict(c) for c in self.clashes],
                     factions=[asdict(f) for f in self.factions],
                     quads=[asdict(q) for q in self.quads])
@@ -2888,29 +3241,143 @@ class Campaign:
         return best
 
     def auto_resolve(self, cl: Clash):
-        """Resuelve un choque IA contra IA comparando puntos con algo de azar."""
+        """Choque IA contra IA: se resuelve con el mismo motor que la resolución rápida."""
         q = self.quad(cl.col, cl.row)
         a, d = self.faction(cl.att_fid), self.faction(cl.def_fid)
         if a is None or d is None or cl.att_force >= len(a.forces) or cl.def_force >= len(d.forces):
             if cl in self.clashes:
                 self.clashes.remove(cl)
-            return
-        ua = [u for u in a.forces[cl.att_force].units if u.status == "active"]
-        ud = [u for u in d.forces[cl.def_force].units if u.status == "active"]
-        pa, pd = sum(u.pts for u in ua) + 50, sum(u.pts for u in ud) + 50
-        winner = "att" if random.random() * pa > random.random() * pd * 1.1 else "def"
+            return None
+        return self.quick_resolve(q, cl.att_fid, cl.def_fid, cl, note=tr("ai.auto"))
 
-        def rows(units, won):
+    # ---- resolución rápida ---------------------------------------------------------
+    def quick_side(self, q: Quadrant, f: Optional[Faction], fi: Optional[int], defending: bool) -> dict:
+        """Fuerza de un bando: puntos activos (reducidos por cicatrices) y modificadores porcentuales."""
+        units = self.participants(q, f, fi) if f is not None else []
+        base = sum(u.pts * max(0.5, 1 - 0.06 * len(u.scars)) for u in units)
+        terrain = faction_mod = morale = 0.0
+        if defending:
+            if q.biome in (1, 2, 3):                        # bosque, ruinas y colinas dan cobertura
+                terrain += 0.05
+            if f is not None and q.owner == f.fid:          # fortificaciones del territorio propio
+                terrain += min(0.20, 0.08 * q.buildings.count("fortress"))
+                terrain += min(0.10, 0.05 * q.buildings.count("tower"))
+        if units:
+            faction_mod = 0.03 * sum(rank_of(u.xp) for u in units) / len(units)
+            morale = -0.05 * sum(1 for u in units if u.unpaid) / len(units)
+            morale -= 0.03 * sum(scar_mods(u)["morale"] for u in units) / len(units)
+        return dict(units=units, base=base, terrain=terrain, faction=faction_mod, morale=morale,
+                    total=base * (1 + terrain + faction_mod + morale))
+
+    def quick_preview(self, q: Quadrant, att_fid, def_fid, clash: Optional[Clash] = None) -> dict:
+        att, dfn = self.faction(att_fid), self.faction(def_fid)
+        ai = clash.att_force if clash and clash.att_fid == att_fid else None
+        di = clash.def_force if clash and clash.def_fid == def_fid else None
+        return dict(att=self.quick_side(q, att, ai, False), dfn=self.quick_side(q, dfn, di, True))
+
+    def quick_resolve(self, q: Quadrant, att_fid, def_fid, clash: Optional[Clash] = None, note: str = "",
+                      mission: str = "", rng=None) -> dict:
+        """
+        Resuelve un combate sin tablero. Fuerza = puntos activos x (1 + terreno + facción + moral),
+        multiplicada por un factor aleatorio de ±QUICK_RANDOM. La diferencia relativa decide el
+        ganador y la proporción de bajas (caídas/destruidas); los supervivientes ganan XP y los
+        caídos pueden sufrir cicatrices. Todo se registra igual que un resultado manual.
+        """
+        rng = rng or random
+        pv = self.quick_preview(q, att_fid, def_fid, clash)
+        sa, sd = pv["att"], pv["dfn"]
+        ra = rng.uniform(1 - QUICK_RANDOM, 1 + QUICK_RANDOM)
+        rd = rng.uniform(1 - QUICK_RANDOM, 1 + QUICK_RANDOM)
+        A, D = sa["total"] * ra, sd["total"] * rd
+        if not sa["units"] and not sd["units"]:
+            winner, m = "draw", 0.0
+        elif not sa["units"]:
+            winner, m = "def", 1.0
+        elif not sd["units"]:
+            winner, m = "att", 1.0
+        else:
+            m = abs(A - D) / max(1.0, A + D)
+            winner = "draw" if m < 0.03 else ("att" if A > D else "def")
+
+        def rows_for(units, won, lost):
+            n = len(units)
+            if winner == "draw":
+                p = 0.18
+            elif won:
+                p = max(0.04, 0.22 - 0.2 * m)
+            else:
+                p = min(0.85, 0.30 + 0.5 * m)
+            k = int(round(p * n))
+            if lost and n and k == 0:
+                k = 1                                         # el bando perdedor siempre sufre bajas
+            pool = list(range(n))
+            rng.shuffle(pool)
+            hit = set(pool[:k])
             out = []
-            for u in units:
-                state = "ok"
-                if random.random() < (0.15 if won else 0.45):
-                    state = "destroyed" if random.random() < 0.25 else "fallen"
-                out.append((u, state, 0 if state != "ok" else (2 if won else 1)))
+            for i, u in enumerate(units):
+                state, scar = "ok", ""
+                if i in hit:
+                    state = "destroyed" if rng.random() < 0.15 + (0.20 if lost and m > 0.4 else 0.0) else "fallen"
+                    if state == "fallen" and rng.random() < 0.40:
+                        scar = roll_scar(rng)
+                elif lost and rng.random() < 0.12:            # superviviente por poco
+                    scar = roll_scar(rng)
+                xp = 0 if state != "ok" else (2 if won else 1)
+                out.append((u, state, xp, scar))
             return out
 
-        self.record_battle(q, a.fid, d.fid, winner, rows(ua, winner == "att"), rows(ud, winner == "def"),
-                           tr("ai.auto"), cl)
+        att_rows = rows_for(sa["units"], winner == "att", winner == "def")
+        def_rows = rows_for(sd["units"], winner == "def", winner == "att")
+        msgs = self.record_battle(q, att_fid, def_fid, winner, att_rows, def_rows, note or tr("qr.note"),
+                                  clash, mission)
+        return dict(winner=winner, A=A, D=D, ra=ra, rd=rd, preview=pv, att_rows=att_rows,
+                    def_rows=def_rows, msgs=msgs)
+
+    # ---- estadísticas de campaña ---------------------------------------------------
+    def victory_points(self, f: Faction) -> int:
+        """VP de campaña = territorios + edificios/2 + 2 por cada victoria registrada."""
+        mine = [q for q in self.quads if q.owner == f.fid]
+        wins = sum(1 for q in self.quads for r in q.history
+                   if (r.winner == "att" and r.att_fid == f.fid) or (r.winner == "def" and r.def_fid == f.fid))
+        return len(mine) + sum(len(q.buildings) for q in mine) // 2 + 2 * wins
+
+    def snapshot(self):
+        snap = dict(t=self.turn, terr={}, vp={}, pts={})
+        for f in self.factions:
+            k = str(f.fid)
+            snap["terr"][k] = sum(1 for q in self.quads if q.owner == f.fid)
+            snap["vp"][k] = self.victory_points(f)
+            snap["pts"][k] = f.pts_total("active")
+        if self.stats_history and self.stats_history[-1].get("t") == self.turn:
+            self.stats_history[-1] = snap
+        else:
+            self.stats_history.append(snap)
+        self.stats_history = self.stats_history[-300:]
+
+    def stats(self) -> dict:
+        per = {f.fid: dict(won=0, lost=0, draw=0, inflicted=0, suffered=0, destroyed=0) for f in self.factions}
+        battles, disputed = 0, []
+        for q in self.quads:
+            if q.history:
+                disputed.append((len(q.history), q))
+            for r in q.history:
+                battles += 1
+                for fid, side in ((r.att_fid, "att"), (r.def_fid, "def")):
+                    if fid not in per:
+                        continue
+                    p = per[fid]
+                    if r.winner == "draw":
+                        p["draw"] += 1
+                    elif r.winner == side:
+                        p["won"] += 1
+                    else:
+                        p["lost"] += 1
+                    own, other = (r.att_losses, r.def_losses) if side == "att" else (r.def_losses, r.att_losses)
+                    p["suffered"] += own
+                    p["inflicted"] += other
+                    p["destroyed"] += r.att_destroyed if side == "att" else r.def_destroyed
+        disputed.sort(key=lambda e: (-e[0], e[1].row, e[1].col))
+        return dict(battles=battles, per=per, disputed=disputed)
 
     # ---- Hall of Fame -----------------------------------------------------------
     def hall_entries(self) -> List[tuple]:
@@ -2996,6 +3463,7 @@ class Campaign:
         c.pts_per_rr = int(d.get("pts_per_rr", 25))
         c.logistics = bool(d.get("logistics", False))      # partidas antiguas: sin logística
         c.solo = bool(d.get("solo", False))
+        c.stats_history = [dict(s) for s in d.get("stats_history", [])]
         c.routes = [[int(x) for x in rt] for rt in d.get("routes", [])]
         c.clashes = [_mk(Clash, x) for x in d.get("clashes", [])]
         c.log = list(d.get("log", []))
@@ -3025,6 +3493,8 @@ class Campaign:
         if len(c.quads) != c.cols * c.rows:
             raise ValueError("inconsistent campaign map")
         c.ensure_state()
+        if not c.stats_history:
+            c.snapshot()
         return c
 
 
@@ -3112,6 +3582,9 @@ class BattleState:
         self.side_b = ""                   # misión secundaria del jugador B (defensor)
         self.solo = False                  # batalla del modo solitario/coop contra la IA
         self.briefing = ""                 # resumen de fuerzas / nota Solo-Coop
+        self.obj_custom = False            # objetivos colocados a mano (no vuelven a la plantilla)
+        self.sel_obj = -1                  # objetivo seleccionado (arrastre)
+        self.quad_pos: Optional[Tuple[int, int]] = None    # territorio de campaña de esta batalla
         self.auto_counts()
 
     @property
@@ -3135,6 +3608,7 @@ class BattleState:
 
     def set_mission(self, key: str):
         self.mission = key if key in MISSION_LAYOUT else ""
+        self.obj_custom = False
         self.place_objectives()
 
     def supply_pos(self) -> Tuple[float, float]:
@@ -3202,13 +3676,18 @@ class BattleState:
 
     def set_size(self, idx: int):
         old = self.W * self.H
+        ow, oh = self.W, self.H
         self.size_idx = idx
         ratio = (self.W * self.H) / old
         for k in list(self.counts):
             self.counts[k] = int(round(self.counts[k] * ratio))
         self.pieces = []
         self.sel_piece = None
-        self.place_objectives()
+        if self.obj_custom and self.objectives:       # objetivos a mano: se reescalan con el tablero
+            self.objectives = [[round(x * self.W / ow * 2) / 2, round(y * self.H / oh * 2) / 2]
+                               for x, y in self.objectives]
+        else:
+            self.place_objectives()
         self.last_msg = tr("bt.size_msg", w=self.W, h=self.H)
 
     def add_custom_type(self) -> Optional[TerrainType]:
@@ -3312,6 +3791,7 @@ class BattleState:
                     condition=self.condition, mission=self.mission, objectives=self.objectives,
                     show_obj=self.show_obj, extras=self.extras, side_a=self.side_a,
                     side_b=self.side_b, solo=self.solo, briefing=self.briefing,
+                    obj_custom=self.obj_custom, quad_pos=self.quad_pos,
                     types=[asdict(t) for t in self.types],
                     pieces=[asdict(p) for p in self.pieces])
 
@@ -3344,6 +3824,9 @@ class BattleState:
         b.side_b = d.get("side_b") if d.get("side_b") in SIDES else ""
         b.solo = bool(d.get("solo", False))
         b.briefing = str(d.get("briefing", ""))
+        b.obj_custom = bool(d.get("obj_custom", False))
+        qp = d.get("quad_pos")
+        b.quad_pos = (int(qp[0]), int(qp[1])) if isinstance(qp, (list, tuple)) and len(qp) == 2 else None
         b.counts = {k: int(v) for k, v in d.get("counts", {}).items()}
         for t in b.types:
             b.counts.setdefault(t.key, 0)
@@ -3521,6 +4004,8 @@ def draw_board(surf, b: BattleState, ox, oy, sc, fonts, sel=None, flag_overlap=T
             pygame.draw.circle(surf, (30, 24, 8), (cx, cy), rad + 3)
             pygame.draw.circle(surf, (242, 202, 72), (cx, cy), rad)
             pygame.draw.circle(surf, (130, 86, 10), (cx, cy), rad, 2)
+            if i == getattr(b, "sel_obj", -1):
+                pygame.draw.circle(surf, C_ACCENT, (cx, cy), rad + 6, 2)
             t = fonts["s"].render(str(i + 1), True, (40, 26, 4))
             surf.blit(t, t.get_rect(center=(cx, cy)))
     if "supply_drop" in b.extras:                        # contenedor del evento Supply Drop
@@ -3572,6 +4057,226 @@ def export_battle(b: BattleState, fonts) -> Tuple[str, str]:
     with open(js, "w", encoding="utf-8") as fh:
         json.dump(b.to_dict(), fh, ensure_ascii=False, indent=2)
     return png, js
+
+
+# =============================================================================
+#  HOJA DE BATALLA IMPRIMIBLE (PNG de alta resolución + PDF de una página)
+# =============================================================================
+def wrap_text(font, text: str, width: int) -> List[str]:
+    lines, cur = [], ""
+    for w in str(text).split():
+        test = (cur + " " + w).strip()
+        if font.size(test)[0] <= width or not cur:
+            cur = test
+        else:
+            lines.append(cur)
+            cur = w
+    if cur:
+        lines.append(cur)
+    return lines
+
+
+def fit_text(font, text: str, width: int) -> str:
+    text = str(text)
+    if font.size(text)[0] <= width:
+        return text
+    while text and font.size(text + "..")[0] > width:
+        text = text[:-1]
+    return text + ".."
+
+
+def battle_sides(camp: "Campaign", b: "BattleState") -> List[tuple]:
+    """[(facción, unidades)] de los (hasta) dos bandos enfrentados en la batalla actual."""
+    q = camp.quad(*b.quad_pos) if (b.quad_pos and camp.in_bounds(*b.quad_pos)) else None
+    pairs: List[tuple] = []                              # (fid, índice de ejército o None)
+    if q is not None:
+        clash = next((c for c in camp.clashes if (c.col, c.row) == (q.col, q.row)), None)
+        if clash:
+            pairs = [(clash.att_fid, clash.att_force), (clash.def_fid, clash.def_force)]
+        else:
+            for g, _i, _c in camp.forces_at(q.col, q.row):
+                if all(g.fid != p[0] for p in pairs):
+                    pairs.append((g.fid, None))
+            if q.owner is not None and all(q.owner != p[0] for p in pairs):
+                pairs.append((q.owner, None))
+    for f in camp.factions:
+        if len(pairs) >= 2:
+            break
+        if all(f.fid != p[0] for p in pairs):
+            pairs.append((f.fid, None))
+    out = []
+    for fid, fi in pairs[:2]:
+        f = camp.faction(fid)
+        if f is None:
+            continue
+        if q is not None:
+            units = camp.participants(q, f, fi)
+        else:
+            units = [u for u in f.all_units() if u.status == "active"] or \
+                    [u for u in f.all_units() if u.status == "reserve"]
+        out.append((f, units))
+    return out
+
+
+def build_battle_sheet(b: "BattleState", camp: "Campaign") -> "pygame.Surface":
+    """Dibuja la hoja (A4 apaisado a 150 ppp: 1754x1240) con tablero, misiones y ejércitos."""
+    SW, SH = 1754, 1240
+    PAPER, INK, MUTED, LINE, ACC = (252, 251, 247), (28, 30, 36), (96, 100, 112), (168, 170, 178), (170, 106, 18)
+    f = make_fonts(1.8)
+    surf = pygame.Surface((SW, SH))
+    surf.fill(PAPER)
+
+    def lh(k):
+        return f[k].size("Ag")[1] + 4
+
+    def text(s, pos, font="s", col=INK, anchor="topleft"):
+        img = f[font].render(str(s), True, col)
+        surf.blit(img, img.get_rect(**{anchor: pos}))
+        return lh(font)
+
+    def head(title, x, y, w):
+        text(title, (x, y), "s", ACC)
+        pygame.draw.line(surf, LINE, (x, y + lh("s")), (x + w, y + lh("s")), 2)
+        return y + lh("s") + 8
+
+    # --- cabecera
+    text(tr("rep.title"), (40, 22), "xl", INK)
+    sub = tr("rep.board", w=b.W, h=b.H) + f" · {tr('deploy.' + b.deploy)}"
+    if b.context:
+        sub += f" · {b.context}"
+    text(fit_text(f["xs"], sub, 1250), (40, 22 + lh("xl")), "xs", MUTED)
+    text(time.strftime("%Y-%m-%d"), (SW - 40, 30), "s", MUTED, "topright")
+    text(camp.name, (SW - 40, 30 + lh("s")), "xs", MUTED, "topright")
+    pygame.draw.line(surf, INK, (40, 126), (SW - 40, 126), 3)
+
+    # --- tablero
+    bx0, by0, bw, bh = 40, 150, 1090, 790
+    sc = min((bw - 70) / b.W, (bh - 50) / b.H)
+    ox, oy = bx0 + 60, by0 + 36
+    draw_board(surf, b, ox, oy, sc, f, sel=None, flag_overlap=False)
+    board_bottom = oy + b.H * sc
+
+    # --- columna derecha
+    rx, rw, y = 1170, 544, 150
+    y = head(tr("rep.mission"), rx, y, rw)
+    if b.mission:
+        y += text(tr("ms." + b.mission), (rx, y), "m")
+        y += text(tr("rep.objectives", n=len(b.objectives)), (rx, y), "xs", MUTED)
+        for line in wrap_text(f["xs"], tr(f"ms.{b.mission}.d"), rw)[:5]:
+            y += text(line, (rx, y), "xs")
+    else:
+        y += text(tr("rep.none"), (rx, y), "xs", MUTED)
+    y += 14
+    y = head(tr("rep.events"), rx, y, rw)
+    if b.extras:
+        for k in b.extras[:4]:
+            y += text(tr("ev." + k), (rx, y), "s")
+            for line in wrap_text(f["xs"], tr(f"ev.{k}.d"), rw)[:2]:
+                y += text(line, (rx, y), "xs", MUTED)
+    else:
+        y += text(tr("rep.none"), (rx, y), "xs", MUTED)
+    y += 14
+    y = head(tr("rep.deploy"), rx, y, rw)
+    y += text(tr("deploy." + b.deploy), (rx, y), "s")
+    y += text(tr("rep.depth", d=f"{b.eff_depth():.0f}"), (rx, y), "xs", MUTED)
+    for line in wrap_text(f["xs"], tr(f"deploy.{b.deploy}.d"), rw)[:3]:
+        y += text(line, (rx, y), "xs")
+    if b.condition:
+        y += 4
+        y += text(tr("rep.cond", c=rname(b.condition)), (rx, y), "s")
+        for line in wrap_text(f["xs"], rdesc(b.condition), rw)[:2]:
+            y += text(line, (rx, y), "xs", MUTED)
+    y += 14
+    y = head(tr("rep.sides"), rx, y, rw)
+    for lab, key in (("A", b.side_a), ("B", b.side_b)):
+        if y > SH - 80:
+            break
+        y += text(tr("rep.player", l=lab) + ": " + (tr("sd." + key) if key else tr("rep.none")), (rx, y), "s")
+        if key:
+            vp, cr, rr = SIDE_REWARD[key]
+            for line in wrap_text(f["xs"], tr(f"sd.{key}.d"), rw)[:2]:
+                y += text(line, (rx, y), "xs", MUTED)
+            y += text(tr("sd.reward", vp=vp, cr=cr, rr=rr), (rx, y), "xs", ACC)
+        y += 6
+
+    # --- ejércitos enfrentados
+    ty = max(int(board_bottom) + 34, by0 + 560)
+    ty = min(ty, SH - 300)
+    sides = battle_sides(camp, b)
+    colw = 540
+    for si, (fac, units) in enumerate(sides):
+        x = 40 + si * (colw + 20)
+        yy = head(f"{tr('rep.armies')} · {tr('rep.player', l='AB'[si])}", x, ty, colw)
+        pygame.draw.rect(surf, fac.color, (x, yy + 2, 22, lh("s") - 6))
+        yy += text(f"  {fac.name} · {fac.army_system}", (x + 24, yy), "s")
+        total = sum(u.pts for u in units)
+        text(tr("rep.total", p=total), (x + colw, yy - lh("s")), "s", ACC, "topright")
+        text(tr("rep.h_unit"), (x, yy), "xs", MUTED)
+        text("Q", (x + 330, yy), "xs", MUTED)
+        text("D", (x + 380, yy), "xs", MUTED)
+        text("Pts", (x + 480, yy), "xs", MUTED, "topright")
+        text(tr("rep.h_state"), (x + colw, yy), "xs", MUTED, "topright")
+        yy += lh("xs") + 2
+        room = max(1, (SH - 70 - yy) // (lh("xs") + 2))
+        shown = units[:room] if len(units) <= room else units[:room - 1]
+        for u in shown:
+            text(fit_text(f["xs"], u.name, 310), (x, yy), "xs")
+            text(f"{eff_quality(u)}+", (x + 330, yy), "xs")
+            text(f"{eff_defense(u)}+", (x + 380, yy), "xs")
+            text(str(u.pts), (x + 480, yy), "xs", INK, "topright")
+            text(tr("st." + u.status), (x + colw, yy), "xs", MUTED, "topright")
+            yy += lh("xs") + 2
+        if len(shown) < len(units):
+            text(tr("rep.more", n=len(units) - len(shown)), (x, yy), "xs", MUTED)
+    pygame.draw.line(surf, LINE, (40, SH - 52), (SW - 40, SH - 52), 1)
+    text(tr("rep.footer", v=APP_VERSION, d=time.strftime("%Y-%m-%d %H:%M")), (40, SH - 44), "xs", MUTED)
+    return surf
+
+
+def write_pdf_image(path: str, surf) -> None:
+    """Escribe un PDF de una página con la imagen incrustada (RGB + Flate), sin dependencias externas."""
+    w, h = surf.get_size()
+    data = zlib.compress(pygame.image.tostring(surf, "RGB"), 6)
+    pw, ph = (842, 595) if w >= h else (595, 842)
+    s = min(pw / w, ph / h)
+    iw, ih = w * s, h * s
+    content = f"q {iw:.2f} 0 0 {ih:.2f} {(pw - iw) / 2:.2f} {(ph - ih) / 2:.2f} cm /Im0 Do Q".encode("ascii")
+
+    def stream(d: bytes, extra: str = "") -> bytes:
+        return f"<< /Length {len(d)} {extra}>>\nstream\n".encode("ascii") + d + b"\nendstream"
+
+    objs = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {pw} {ph}] "
+        f"/Resources << /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>".encode("ascii"),
+        stream(content),
+        stream(data, f"/Type /XObject /Subtype /Image /Width {w} /Height {h} "
+                     f"/ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /FlateDecode "),
+    ]
+    out = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for i, o in enumerate(objs, 1):
+        offsets.append(len(out))
+        out += f"{i} 0 obj\n".encode("ascii") + o + b"\nendobj\n"
+    xref = len(out)
+    out += f"xref\n0 {len(objs) + 1}\n".encode("ascii") + b"0000000000 65535 f \n"
+    for off in offsets:
+        out += f"{off:010d} 00000 n \n".encode("ascii")
+    out += f"trailer\n<< /Size {len(objs) + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode("ascii")
+    with open(path, "wb") as fh:
+        fh.write(bytes(out))
+
+
+def export_battle_sheet(b: "BattleState", camp: "Campaign") -> Tuple[str, str]:
+    os.makedirs(EXPORT_DIR, exist_ok=True)
+    surf = build_battle_sheet(b, camp)
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    png = os.path.join(EXPORT_DIR, f"opr_battle_sheet_{stamp}.png")
+    pdf = os.path.join(EXPORT_DIR, f"opr_battle_sheet_{stamp}.pdf")
+    pygame.image.save(surf, png)
+    write_pdf_image(pdf, surf)
+    return png, pdf
 
 
 # =============================================================================
@@ -3789,10 +4494,11 @@ class UI:
             self.text(l, (x + 8, y + 5 + i * 16), "xs", C_TEXT)
 
 
-def make_fonts() -> Dict[str, pygame.font.Font]:
+def make_fonts(scale: float = 1.0) -> Dict[str, pygame.font.Font]:
     names = "segoeui,dejavusans,arial,helvetica,liberationsans,freesans"
 
     def f(size, bold=False):
+        size = max(8, int(size * scale))
         try:
             return pygame.font.SysFont(names, size, bold=bold)
         except Exception:
@@ -4303,13 +5009,16 @@ class CampaignView(View):
             self.route_mode = None if active else (q.col, q.row)
 
         by = bottom - 30
-        half = (pw - 28 - 4) // 2
-        if ui.button((x, by, half, 30), tr("camp.prepare_short"), color=(150, 100, 30), font="xs",
+        third = (pw - 28 - 8) // 3
+        if ui.button((x, by, third, 30), tr("camp.prepare_short"), color=(150, 100, 30), font="xs",
                      tip=tr("camp.prepare_tip")):
             self.app.start_battle_for(q)
-        if ui.button((x + half + 4, by, half, 30), tr("camp.record"), color=(60, 120, 76), font="xs",
+        if ui.button((x + third + 4, by, third, 30), tr("camp.record"), color=(60, 120, 76), font="xs",
                      enabled=len(camp.factions) > 0, tip=tr("camp.record_tip")):
             self.app.open_result(q)
+        if ui.button((x + 2 * (third + 4), by, third, 30), tr("camp.quick"), color=(70, 100, 150), font="xs",
+                     enabled=len(camp.factions) > 0, tip=tr("qr.btn_tip")):
+            self.app.open_quick(q)
 
     # ---- pestaña: historial -----------------------------------------------
     def tab_hist(self, ui, camp, q, x, y, pw, bottom):
@@ -4353,7 +5062,8 @@ class BattleView(View):
     def __init__(self, app):
         super().__init__(app)
         self.drag: Optional[Tuple[int, float, float]] = None
-        self.ltab = "terrain"           # pestaña del panel izquierdo: terrain | deploy | rules
+        self.drag_obj: Optional[int] = None     # índice del objetivo que se arrastra
+        self.ltab = "terrain"           # pestaña del panel izquierdo: terrain | deploy | rules | mission
         self.rule_target = "type"       # a qué se aplican los interruptores de reglas
 
     def layout(self):
@@ -4374,6 +5084,11 @@ class BattleView(View):
         if e.type == pygame.MOUSEBUTTONDOWN and board.collidepoint(e.pos):
             bx, by = (e.pos[0] - ox) / sc, (e.pos[1] - oy) / sc
             if e.button == 1:
+                oi = self.obj_hit(b, bx, by, sc)
+                if oi is not None:                      # los objetivos tienen prioridad sobre el terreno
+                    b.sel_obj = self.drag_obj = oi
+                    return
+                b.sel_obj = -1
                 idx = b.hit(bx, by)
                 if idx is not None:
                     b.sel_piece = idx
@@ -4395,6 +5110,11 @@ class BattleView(View):
                 if idx is not None:
                     b.pieces.pop(idx)
                     b.sel_piece = None
+        elif e.type == pygame.MOUSEMOTION and self.drag_obj is not None:
+            if self.drag_obj < len(b.objectives):
+                b.objectives[self.drag_obj] = [clamp((e.pos[0] - ox) / sc, 2, b.W - 2),
+                                               clamp((e.pos[1] - oy) / sc, 2, b.H - 2)]
+                b.obj_custom = True
         elif e.type == pygame.MOUSEMOTION and self.drag:
             idx, dx, dy = self.drag
             if idx < len(b.pieces):
@@ -4403,6 +5123,10 @@ class BattleView(View):
                 p.y = (e.pos[1] - oy) / sc - dy
                 b.clamp_piece(p)
         elif e.type == pygame.MOUSEBUTTONUP and e.button == 1:
+            if self.drag_obj is not None and self.drag_obj < len(b.objectives):
+                o = b.objectives[self.drag_obj]
+                b.objectives[self.drag_obj] = [round(o[0] * 2) / 2, round(o[1] * 2) / 2]
+            self.drag_obj = None
             if self.drag and self.drag[0] < len(b.pieces):
                 p = b.pieces[self.drag[0]]
                 p.x, p.y = round(p.x * 2) / 2, round(p.y * 2) / 2
@@ -4415,6 +5139,18 @@ class BattleView(View):
                 b.sel_piece = None
             elif e.key == pygame.K_g:
                 b.generate(False)
+
+    @staticmethod
+    def obj_hit(b: BattleState, bx: float, by: float, sc: float) -> Optional[int]:
+        """Índice del marcador de objetivo bajo el punto (en cm), o None."""
+        if not b.show_obj:
+            return None
+        rad = max(2.2, 9 / sc) + 0.8
+        for i in range(len(b.objectives) - 1, -1, -1):
+            ox_, oy_ = b.objectives[i]
+            if math.hypot(bx - ox_, by - oy_) <= rad:
+                return i
+        return None
 
     # ------------------------------------------------------------------
     def draw(self, ui: UI):
@@ -4445,7 +5181,20 @@ class BattleView(View):
         if b.context:
             title += f"  ·  {b.context}"
         ui.text(ui.fit(title, "m", 600), (self.AREA.x + 4, self.AREA.y + 2), "m", C_TEXT)
-        ui.text(tr("bt.help"), (self.AREA.right - 4, self.AREA.y + 5), "xs", C_DIM, "topright")
+        if ui.button((self.AREA.right - 150, self.AREA.y, 150, 22), tr("qr.btn"), font="xs",
+                     enabled=bool(b.quad_pos and self.app.campaign.in_bounds(*b.quad_pos)
+                                  and self.app.campaign.factions), color=(70, 100, 150), tip=tr("qr.btn_tip")):
+            self.app.open_quick(self.app.campaign.quad(*b.quad_pos))
+        if ui.button((self.AREA.right - 306, self.AREA.y, 150, 22), tr("rep.btn"), font="xs",
+                     tip=tr("rep.btn_tip")):
+            try:
+                _png, pdf = export_battle_sheet(b, self.app.campaign)
+                b.last_msg = tr("rep.saved", f=os.path.basename(pdf))
+                self.app.set_status(tr("rep.saved_path", path=EXPORT_DIR))
+            except Exception as ex:  # noqa
+                self.app.set_status(tr("status.export_err", err=ex), error=True)
+        if ui.over((self.AREA.x, self.AREA.y, 620, 22)):
+            ui.tip = tr("bt.help") + "  ·  " + tr("ms.drag_hint")
         draw_board(scr, b, ox, oy, sc, self.app.fonts, sel=b.sel_piece)
         self.draw_strip(ui, b)
 
@@ -4649,9 +5398,13 @@ class BattleView(View):
             for line in ui.wrap(tr(f"ms.{b.mission}.d"), "xs", 292)[:6]:
                 ui.text(line, (18, y), "xs", C_TEXT)
                 y += 14
-        if ui.button((16, 332, 300, 22), tr("ms.show", s=tr("on") if b.show_obj else tr("off")),
-                     active=b.show_obj, font="xs"):
+        if ui.button((16, 332, 196, 22), tr("ms.show", s=tr("on") if b.show_obj else tr("off")),
+                     active=b.show_obj, font="xs", tip=tr("ms.drag_hint")):
             b.show_obj = not b.show_obj
+        if ui.button((216, 332, 100, 22), tr("ms.reset"), font="xs", enabled=bool(b.mission),
+                     tip=tr("ms.reset_tip")):
+            b.obj_custom = False
+            b.place_objectives()
 
         ui.text(tr("ev.title"), (18, 360), "xs", C_ACCENT)
         for i, k in enumerate(EXTRAS):
@@ -5003,11 +5756,16 @@ class FactionView(View):
             tcol = (120, 122, 132) if dim else C_TEXT
             pygame.draw.rect(ui.screen, self.STATUS_COL[u.status], (36, y + 5, 10, 14), border_radius=2)
             ui.text(ui.fit(u.name, "s", 300), (54, y + 4), "s", tcol)
-            for txt, x in ((f"{u.size}", 388), (f"{u.quality}+", 430), (f"{u.defense}+", 464),
+            for txt, x in ((f"{u.size}", 388), (f"{eff_quality(u)}+", 430), (f"{eff_defense(u)}+", 464),
                            (f"{u.pts}", 502), (f"{u.rr_cost}", 558)):
                 ui.text(txt, (x, y + 4), "s", tcol)
             ap = ap_available(u)
             ui.text(f"{u.xp}" + (" *" if ap else ""), (598, y + 4), "s", C_GOOD if ap and not dim else tcol)
+            if u.scars:                                          # marca de cicatrices activas
+                pygame.draw.circle(ui.screen, (236, 140, 70), (588, y + 12), 7, 2)
+                ui.text(str(len(u.scars)), (588, y + 12), "xs", (236, 140, 70), "center")
+                if ui.over(pygame.Rect(578, y, 16, 24)):
+                    ui.tip = scar_summary(u)
             if u.unpaid:
                 ui.text("!", (636, y + 4), "s", C_BAD)
                 if ui.over(row):
@@ -5061,7 +5819,8 @@ class FactionView(View):
         else:
             ui.text(tr("army.reserve_note"), (682, 168), "xs", C_DIM)
 
-        for i, (key, lab) in enumerate((("unit", "army.tab_unit"), ("xp", "army.tab_xp"))):
+        for i, (key, lab) in enumerate((("unit", "army.tab_unit"), ("xp", "army.tab_xp"),
+                                        ("scar", "army.tab_scar"))):
             if ui.button((682 + i * 158, 196, 152, 22), tr(lab), active=(self.ed_tab == key), font="xs"):
                 self.ed_tab = key
         pygame.draw.line(ui.screen, C_LINE, (682, 220), (1250, 220))
@@ -5076,6 +5835,8 @@ class FactionView(View):
         uid = f"{fac.fid}_{fi}_{self.sel_unit}"
         if self.ed_tab == "unit":
             self.draw_unit_tab(ui, fac, fi, u, uid, camp)
+        elif self.ed_tab == "scar":
+            self.draw_scar_tab(ui, u)
         else:
             self.draw_xp_tab(ui, u)
         self.draw_unit_buttons(ui, fac, fi, fc, u)
@@ -5126,7 +5887,8 @@ class FactionView(View):
         u.notes = ui.text_field(f"u_notes_{uid}", (fx, 470, 480, 28), u.notes, 300)
         yy = 506
         for label, txt, mx in (("army.prev_rules", u.rules, 1), ("army.prev_weapons", u.weapons, 2),
-                               ("army.prev_upgrades", u.upgrades, 1), ("army.prev_adv", adv_summary(u), 1)):
+                               ("army.prev_upgrades", u.upgrades, 1), ("army.prev_adv", adv_summary(u), 1),
+                               ("army.prev_scar", scar_summary(u), 1)):
             if txt:
                 for line in ui.wrap(tr(label, t=txt), "xs", 566)[:mx]:
                     ui.text(line, (682, yy), "xs", C_DIM)
@@ -5157,6 +5919,39 @@ class FactionView(View):
                      font="xs", tip=tr("hall.rem_tip") if u.hall else tr("hall.add_tip")):
             u.hall = not u.hall
         ui.text(tr("hall.record", b=u.battles, s=u.survived, w=u.wins), (x, 574), "xs", C_DIM)
+
+    # ---- editor: cicatrices de guerra ----------------------------------------
+    def draw_scar_tab(self, ui, u):
+        x = 682
+        ui.text(ui.fit(u.name, "m", 560), (x, 232), "m", C_TEXT)
+        eff = scar_effects(u)
+        ui.text(tr("scar.eff", t=eff) if eff else tr("scar.none"), (x, 256), "s", C_WARN if eff else C_DIM)
+        ui.text(tr("scar.current"), (x, 286), "xs", C_ACCENT)
+        y = 304
+        if not u.scars:
+            ui.text(tr("scar.none_list"), (x, y + 2), "s", (120, 126, 140))
+        for i, s in enumerate(list(u.scars)[:6]):
+            if s["k"] not in SCARS:
+                continue
+            row = pygame.Rect(x, y + i * 28, 568, 26)
+            pygame.draw.rect(ui.screen, C_PANEL2, row, border_radius=4)
+            pygame.draw.rect(ui.screen, (236, 140, 70), (row.x, row.y, 4, row.h), border_radius=2)
+            ui.text(tr("scar." + s["k"]), (row.x + 12, row.centery), "s", C_TEXT, "midleft")
+            ui.text(ui.fit(tr("scar." + s["k"] + ".d"), "xs", 280), (row.x + 170, row.centery), "xs", C_DIM, "midleft")
+            ui.text(tr("scar.turns", n=s["t"]) if s["t"] else tr("scar.perm"), (row.right - 96, row.centery),
+                    "xs", C_WARN, "midright")
+            if ui.button((row.right - 84, row.y + 2, 80, 22), tr("scar.heal"), font="xs", tip=tr("scar.heal_tip")):
+                u.scars.pop(i)
+                self.set_msg(tr("scar.heal") + ": " + tr("scar." + s["k"]))
+                return
+        ui.text(tr("scar.add_title"), (x, 484), "xs", C_ACCENT)
+        for i, k in enumerate(SCARS):
+            if ui.button((x + (i % 2) * 288, 500 + (i // 2) * 28, 280, 26), tr("scar." + k), font="xs",
+                         active=any(s["k"] == k for s in u.scars), tip=tr("scar." + k + ".d")):
+                if add_scar(u, k):
+                    self.set_msg(tr("scar.added", u=u.name, s=tr("scar." + k)))
+        for i, line in enumerate(ui.wrap(tr("scar.note"), "xs", 566)[:2]):
+            ui.text(line, (x, 560 + i * 13), "xs", C_DIM)
 
     # ---- botones comunes del editor ------------------------------------------
     def draw_unit_buttons(self, ui, fac, fi, fc, u):
@@ -5274,7 +6069,7 @@ class HallView(View):
                 ui.text(line, (x, y), "xs", C_TEXT)
                 y += 14
         for label, txt in (("army.prev_rules", u.rules), ("army.prev_weapons", u.weapons),
-                           ("army.prev_upgrades", u.upgrades)):
+                           ("army.prev_upgrades", u.upgrades), ("hall.scars", scar_summary(u))):
             if txt:
                 ui.text(ui.fit(tr(label, t=txt), "xs", 676), (x, y), "xs", C_DIM)
                 y += 14
@@ -5314,12 +6109,152 @@ class HallView(View):
             u.hall = False
 
 
+class StatsView(View):
+    """Resumen de campaña: gráfico de evolución por turno, tabla de facciones y territorios disputados."""
+    METRICS = [("vp", "stats.m_vp"), ("terr", "stats.m_terr"), ("pts", "stats.m_pts")]
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.metric = "vp"
+
+    def draw(self, ui: UI):
+        camp = self.app.campaign
+        scr = ui.screen
+        facs = camp.factions
+        st = camp.stats()
+
+        # ---------------- gráfico de evolución ----------------
+        P = pygame.Rect(20, 58, 800, 386)
+        ui.panel(P, tr("stats.chart_title"))
+        for i, (k, lab) in enumerate(self.METRICS):
+            if ui.button((32 + i * 168, 80, 162, 24), tr(lab), active=(self.metric == k), font="xs"):
+                self.metric = k
+        area = pygame.Rect(P.x + 64, P.y + 62, P.w - 90, P.h - 130)
+        pygame.draw.rect(scr, (24, 27, 34), area, border_radius=4)
+        hist = camp.stats_history
+        series = {f.fid: [h.get(self.metric, {}).get(str(f.fid), 0) for h in hist] for f in facs}
+        turns = [h.get("t", i + 1) for i, h in enumerate(hist)]
+        ymax = max([1] + [v for s in series.values() for v in s])
+        step = 1 if ymax <= 5 else 2 if ymax <= 10 else 5 if ymax <= 30 else 10 if ymax <= 100 else 50
+        top = ((ymax + step - 1) // step) * step
+        for k in range(0, top + 1, step):
+            gy = area.bottom - int(k / top * area.h)
+            pygame.draw.line(scr, (52, 58, 70), (area.x, gy), (area.right, gy))
+            ui.text(str(k), (area.x - 8, gy), "xs", C_DIM, "midright")
+        t0, t1 = (turns[0], turns[-1]) if turns else (1, 1)
+        span = max(1, t1 - t0)
+
+        def px(t):
+            return int(area.x + 16 + (t - t0) / span * (area.w - 32))
+
+        shown_ticks = sorted(set(turns))
+        stride = max(1, len(shown_ticks) // 10 + (1 if len(shown_ticks) % 10 else 0))
+        for i, t in enumerate(shown_ticks):
+            if i % stride == 0 or t == t1:
+                pygame.draw.line(scr, (52, 58, 70), (px(t), area.bottom), (px(t), area.bottom + 4))
+                ui.text(str(t), (px(t), area.bottom + 6), "xs", C_DIM, "midtop")
+        ui.text(tr("stats.axis"), (area.centerx, area.bottom + 22), "xs", C_DIM, "midtop")
+        if len(hist) < 2:
+            ui.text(tr("stats.no_data"), area.center, "s", C_DIM, "center")
+        for f in facs:
+            pts = [(px(t), area.bottom - int(v / top * area.h)) for t, v in zip(turns, series[f.fid])]
+            if len(pts) > 1:
+                pygame.draw.lines(scr, f.color, False, pts, 3)
+            for p in pts:
+                pygame.draw.circle(scr, f.color, p, 4)
+        lx = P.x + 14
+        for f in facs:                                   # leyenda
+            pygame.draw.rect(scr, f.color, (lx, P.bottom - 26, 14, 14), border_radius=3)
+            ui.text(ui.fit(f.name, "xs", 130), (lx + 20, P.bottom - 26), "xs", C_TEXT)
+            lx += 150
+
+        # ---------------- resumen ----------------
+        S = pygame.Rect(830, 58, 430, 386)
+        ui.panel(S, tr("stats.summary"))
+        y = S.y + 34
+        ui.text(tr("stats.turn", n=camp.turn), (S.x + 14, y), "m", C_ACCENT)
+        y += 24
+        ui.text(tr("stats.battles", n=st["battles"]), (S.x + 14, y), "s", C_TEXT)
+        y += 22
+        if facs:
+            lead = max(facs, key=lambda f: camp.victory_points(f))
+            ui.text(ui.fit(tr("stats.leader", f=lead.name, v=camp.victory_points(lead)), "s", 400),
+                    (S.x + 14, y), "s", lead.color if sum(lead.color) > 200 else C_TEXT)
+        y += 30
+        per = st["per"]
+        inf = max(facs, key=lambda f: per[f.fid]["inflicted"]) if facs else None
+        suf = max(facs, key=lambda f: per[f.fid]["suffered"]) if facs else None
+        ui.text(ui.fit(tr("stats.top_inflicted", f=inf.name, n=per[inf.fid]["inflicted"]) if inf and per[inf.fid]["inflicted"]
+                       else tr("stats.top_inflicted", f=tr("stats.none"), n=0), "s", 400), (S.x + 14, y), "s", C_GOOD)
+        y += 22
+        ui.text(ui.fit(tr("stats.top_suffered", f=suf.name, n=per[suf.fid]["suffered"]) if suf and per[suf.fid]["suffered"]
+                       else tr("stats.top_suffered", f=tr("stats.none"), n=0), "s", 400), (S.x + 14, y), "s", C_BAD)
+        y += 22
+        if st["disputed"]:
+            n, q = st["disputed"][0]
+            ui.text(ui.fit(tr("stats.top_disputed", q=f"{quad_label(q.col, q.row)} {q.name}", n=n), "s", 400),
+                    (S.x + 14, y), "s", C_WARN)
+        else:
+            ui.text(tr("stats.top_disputed", q=tr("stats.none"), n=0), (S.x + 14, y), "s", C_DIM)
+        y += 34
+        for line in ui.wrap(tr("stats.vp_def"), "xs", 400):
+            ui.text(line, (S.x + 14, y), "xs", C_DIM)
+            y += 14
+        y += 8
+        maxvp = max([1] + [camp.victory_points(f) for f in facs])
+        for f in sorted(facs, key=lambda f: -camp.victory_points(f))[:6]:        # barras de VP
+            vp = camp.victory_points(f)
+            ui.text(ui.fit(f.name, "xs", 120), (S.x + 14, y), "xs", C_TEXT)
+            pygame.draw.rect(scr, f.color, (S.x + 140, y + 1, int(230 * vp / maxvp), 12), border_radius=3)
+            ui.text(str(vp), (S.x + 376, y), "xs", C_TEXT)
+            y += 18
+
+        # ---------------- tabla por facción ----------------
+        T_ = pygame.Rect(20, 454, 760, 240)
+        ui.panel(T_, tr("stats.table"))
+        cols = [("stats.h_fac", 14), ("stats.h_terr", 220), ("stats.h_vp", 270), ("stats.h_won", 320),
+                ("stats.h_lost", 372), ("stats.h_draw", 424), ("stats.h_inf", 480), ("stats.h_suf", 550),
+                ("stats.h_des", 620)]
+        for key, x in cols:
+            ui.text(tr(key), (T_.x + x, T_.y + 30), "xs", C_DIM)
+        for i, f in enumerate(facs):
+            y = T_.y + 50 + i * 28
+            p = per[f.fid]
+            pygame.draw.rect(scr, C_PANEL2, (T_.x + 8, y - 2, T_.w - 16, 26), border_radius=4)
+            pygame.draw.rect(scr, f.color, (T_.x + 8, y - 2, 5, 26), border_radius=2)
+            ui.text(ui.fit(f.name, "s", 190), (T_.x + 20, y + 3), "s", C_TEXT)
+            terr = sum(1 for q in camp.quads if q.owner == f.fid)
+            vals = [terr, camp.victory_points(f), p["won"], p["lost"], p["draw"], p["inflicted"], p["suffered"],
+                    p["destroyed"]]
+            for (key, x), v in zip(cols[1:], vals):
+                big = (key == "stats.h_inf" and inf is f and v) or (key == "stats.h_suf" and suf is f and v)
+                ui.text(str(v), (T_.x + x, y + 3), "s", (C_GOOD if key == "stats.h_inf" else C_BAD) if big else C_TEXT)
+
+        # ---------------- territorios más disputados ----------------
+        D = pygame.Rect(790, 454, 470, 240)
+        ui.panel(D, tr("stats.disputed"))
+        if not st["disputed"]:
+            ui.text(tr("stats.no_battles"), (D.x + 14, D.y + 38), "s", C_DIM)
+        top_n = st["disputed"][0][0] if st["disputed"] else 1
+        for i, (n, q) in enumerate(st["disputed"][:7]):
+            y = D.y + 34 + i * 28
+            pygame.draw.rect(scr, C_PANEL2, (D.x + 8, y - 2, D.w - 16, 26), border_radius=4)
+            pygame.draw.rect(scr, C_WARN if i == 0 else (110, 116, 130),
+                             (D.x + 8, y - 2, max(6, int((D.w - 16) * n / top_n)), 26), border_radius=4)
+            owner = camp.faction(q.owner)
+            ui.text(ui.fit(f"{quad_label(q.col, q.row)} · {q.name}", "s", 340), (D.x + 16, y + 3), "s",
+                    (20, 20, 24) if i == 0 else C_TEXT)
+            ui.text(str(n), (D.right - 20, y + 3), "s", (20, 20, 24) if i == 0 else C_TEXT, "topright")
+            if owner:
+                pygame.draw.circle(scr, owner.color, (D.right - 44, y + 11), 6)
+
+
 # =============================================================================
 #  APLICACIÓN
 # =============================================================================
 class App:
     TAB_KEYS = [("tab.campaign", "campaign"), ("tab.battle", "battle"), ("tab.factions", "factions"),
-                ("tab.hall", "hall")]
+                ("tab.hall", "hall"), ("tab.stats", "stats")]
 
     def __init__(self):
         pygame.init()
@@ -5341,7 +6276,7 @@ class App:
         self.ui.mouse_fn = lambda: self.to_logical(pygame.mouse.get_pos())
         self.opr = OprDB()
         self.views = {"campaign": CampaignView(self), "battle": BattleView(self),
-                      "factions": FactionView(self), "hall": HallView(self)}
+                      "factions": FactionView(self), "hall": HallView(self), "stats": StatsView(self)}
         self.tab = "campaign"
         self.status = ""
         self.status_err = False
@@ -5364,7 +6299,12 @@ class App:
         self.res: Optional[dict] = None
         self.pick: Optional[dict] = None
         self.cat: Optional[dict] = None
+        self.qr: Optional[dict] = None
+        self.restart = False
+        self.updater = UpdateChecker()
         self.restore_campaigns()
+        if self.settings.get("check_updates", True) and not os.environ.get("OPR_NO_UPDATE_CHECK"):
+            self.updater.start()                       # comprobación asíncrona: nunca bloquea el arranque
 
     # ---- ajustes ----------------------------------------------------------
     @staticmethod
@@ -5596,6 +6536,7 @@ class App:
             fids = [clash.att_fid, clash.def_fid] + [i for i in fids if i not in (clash.att_fid, clash.def_fid)]
         sides = [camp.faction(i) for i in dict.fromkeys(fids)][:2]
         ais = [g for g in sides if g is not None and camp.is_ai(g)]
+        b.quad_pos = (q.col, q.row)
         b.solo = bool(camp.solo and ais)
         b.briefing = ""
         if b.solo:
@@ -5613,6 +6554,171 @@ class App:
         b.generate(False)
         self.switch_tab("battle")
         self.set_status(tr("status.battle_ready"))
+
+    # ---- diálogo de actualización ---------------------------------------------
+    def draw_update_dialog(self, ui: UI):
+        u = self.updater
+        info = u.info
+        if not info:
+            self.dialog = None
+            return
+        dim = pygame.Surface((WIN_W, WIN_H), pygame.SRCALPHA)
+        dim.fill((0, 0, 0, 175))
+        self.screen.blit(dim, (0, 0))
+        box = pygame.Rect(320, 120, 640, 470)
+        ui.panel(box, tr("upd.title"))
+        pygame.draw.rect(self.screen, C_ACCENT, box, 2, border_radius=8)
+        x, y = box.x + 18, box.y + 40
+        for line in ui.wrap(tr("upd.body", new=info["version"], cur=APP_VERSION), "m", 600)[:2]:
+            ui.text(line, (x, y), "m", C_TEXT)
+            y += 22
+        ui.text(tr("upd.src_release") if info["source"] == "release" else tr("upd.src_main"), (x, y + 2), "xs", C_DIM)
+        y += 24
+        if info.get("notes"):
+            ui.text(tr("upd.notes"), (x, y), "xs", C_ACCENT)
+            y += 16
+            for line in ui.wrap(info["notes"].replace("\r", " ").replace("\n", " "), "xs", 600)[:7]:
+                ui.text(line, (x, y), "xs", C_TEXT)
+                y += 14
+        ui.text(ui.fit(tr("upd.manual", u=info["url"]), "xs", 600), (x, box.y + 270), "xs", C_DIM)
+        sy = box.y + 296
+        if u.dl_busy:
+            ui.text(tr("upd.downloading"), (x, sy), "s", C_WARN)
+        elif u.dl_path:
+            ui.text(ui.fit(tr("upd.done", p=u.dl_path), "xs", 600), (x, sy), "xs", C_GOOD)
+            if not u.can_install():
+                for k, line in enumerate(ui.wrap(tr("upd.frozen"), "xs", 600)[:2]):
+                    ui.text(line, (x, sy + 18 + k * 14), "xs", C_WARN)
+        elif u.dl_error:
+            ui.text(ui.fit(tr("upd.failed", err=u.dl_error), "xs", 600), (x, sy), "xs", C_BAD)
+        by = box.bottom - 56
+        if u.dl_path and u.can_install():
+            if ui.button((x, by, 300, 36), tr("upd.install"), color=(60, 120, 76), tip=tr("upd.install_tip")):
+                err = u.install()
+                if err:
+                    self.set_status(tr("upd.install_failed", err=err), error=True)
+                else:
+                    self.save_settings()
+                    self.restart = True
+                    self.running = False
+        else:
+            if ui.button((x, by, 300, 36), tr("upd.download"), color=(60, 120, 76),
+                          enabled=not u.dl_busy and not u.dl_path):
+                u.download()
+        if ui.button((box.right - 18 - 290, by, 290, 36), tr("upd.skip")):
+            self.dialog = None
+            ui.focus = None
+
+    # ---- resolución rápida (diálogo modal) -------------------------------------
+    def default_sides(self, q: Quadrant):
+        camp = self.campaign
+        clash = next((c for c in camp.clashes if (c.col, c.row) == (q.col, q.row)), None)
+        facs = camp.factions
+        if clash:
+            return clash.att_fid, clash.def_fid, clash
+        present = [g.fid for g, _i, _c in camp.forces_at(q.col, q.row)]
+        att = present[0] if present else (facs[0].fid if facs else None)
+        others = [f.fid for f in facs if f.fid != att]
+        dfn = q.owner if (q.owner is not None and q.owner != att) else (others[0] if others else None)
+        return att, dfn, None
+
+    def open_quick(self, q: Quadrant):
+        att, dfn, clash = self.default_sides(q)
+        self.qr = dict(col=q.col, row=q.row, att=att, dfn=dfn, clash=clash, result=None)
+        self.dialog = "quick"
+        self.ui.focus = None
+
+    def draw_quick_dialog(self, ui: UI):
+        camp, r = self.campaign, self.qr
+        if r is None:
+            self.dialog = None
+            return
+        q = camp.quad(r["col"], r["row"])
+        dim = pygame.Surface((WIN_W, WIN_H), pygame.SRCALPHA)
+        dim.fill((0, 0, 0, 175))
+        self.screen.blit(dim, (0, 0))
+        box = pygame.Rect(200, 50, 880, 620)
+        ui.panel(box, tr("qr.title", q=f"{quad_label(q.col, q.row)} · {q.name}"))
+        pygame.draw.rect(self.screen, C_ACCENT, box, 2, border_radius=8)
+        ids = [f.fid for f in camp.factions]
+        fa, fd = camp.faction(r["att"]), camp.faction(r["dfn"])
+        done = r["result"] is not None
+        if ui.button((box.x + 14, box.y + 34, 300, 28), tr("res.att", f=fa.name if fa else "—"),
+                     color=fa.color if fa else None, enabled=not done, tip=tr("res.cycle_tip")) and ids:
+            r["att"] = ids[(ids.index(r["att"]) + 1) % len(ids)] if r["att"] in ids else ids[0]
+            if r["dfn"] == r["att"]:
+                r["dfn"] = None
+        if ui.button((box.x + 322, box.y + 34, 300, 28), tr("res.def", f=fd.name if fd else tr("camp.neutral")),
+                     color=fd.color if fd else None, enabled=not done, tip=tr("res.cycle_tip")):
+            opts = [None] + [i for i in ids if i != r["att"]]
+            cur = opts.index(r["dfn"]) if r["dfn"] in opts else 0
+            r["dfn"] = opts[(cur + 1) % len(opts)]
+
+        clash = r["clash"] if (r["clash"] and (r["clash"].att_fid, r["clash"].def_fid) == (r["att"], r["dfn"])) else None
+        if not done:
+            pv = camp.quick_preview(q, r["att"], r["dfn"], clash)
+            for si, (key, fac) in enumerate((("att", fa), ("dfn", fd))):
+                s = pv[key]
+                x0 = box.x + 14 + si * 430
+                ui.text(ui.fit(fac.name if fac else tr("camp.neutral"), "l", 400), (x0, box.y + 84), "l",
+                        fac.color if fac and sum(fac.color) > 160 else C_TEXT)
+                lines = [(tr("qr.units", n=len(s["units"])), C_DIM), (tr("qr.base", v=s["base"]), C_TEXT),
+                         (tr("qr.terrain", v=s["terrain"] * 100), C_TEXT), (tr("qr.faction", v=s["faction"] * 100), C_TEXT),
+                         (tr("qr.morale", v=s["morale"] * 100), C_TEXT)]
+                for i, (txt, col) in enumerate(lines):
+                    ui.text(txt, (x0, box.y + 124 + i * 24), "s", col)
+                ui.text(tr("qr.total", v=s["total"]), (x0, box.y + 124 + 5 * 24 + 6), "m", C_ACCENT)
+            ui.text(tr("qr.random", p=int(QUICK_RANDOM * 100)), (box.x + 14, box.y + 330), "s", C_DIM)
+            for i, line in enumerate(ui.wrap(tr("res.xp_hint"), "xs", 840)[:1]):
+                ui.text(line, (box.x + 14, box.y + 356), "xs", C_DIM)
+            if r["att"] is None or r["att"] == r["dfn"]:
+                ui.text(tr("qr.no_sides"), (box.x + 14, box.y + 380), "s", C_BAD)
+            if ui.button((box.x + 14, box.bottom - 56, 220, 38), tr("qr.resolve"), color=(60, 120, 76),
+                         enabled=r["att"] is not None and r["att"] != r["dfn"]):
+                bt = self.battle
+                mission = bt.mission if bt.quad_pos == (q.col, q.row) else ""
+                r["result"] = camp.quick_resolve(q, r["att"], r["dfn"], clash, mission=mission)
+                r["clash_used"] = clash
+                self.set_status(tr("status.recorded", q=quad_label(q.col, q.row)))
+            if ui.button((box.right - 234, box.bottom - 56, 220, 38), tr("qr.cancel")):
+                self.dialog = None
+                ui.focus = None
+            return
+
+        res = r["result"]
+        wname = {"att": fa.name if fa else "—", "def": fd.name if fd else tr("camp.neutral")}.get(
+            res["winner"], tr("camp.draw"))
+        ui.text(tr("qr.winner", w=wname), (box.x + 14, box.y + 84), "l", C_ACCENT)
+        ui.text(tr("qr.rolls", a=res["A"], ra=res["ra"], d=res["D"], rd=res["rd"]), (box.x + 14, box.y + 116), "s", C_DIM)
+        scars_all = []
+        for si, (key, fac, rows) in enumerate((("att", fa, res["att_rows"]), ("def", fd, res["def_rows"]))):
+            x0 = box.x + 14 + si * 430
+            lost = sum(1 for row in rows if row[1] != "ok")
+            dest = sum(1 for row in rows if row[1] == "destroyed")
+            xp = sum(row[2] for row in rows)
+            ui.text(ui.fit(tr("qr.losses", n=fac.name if fac else tr("camp.neutral"), l=lost, d=dest, x=xp),
+                           "s", 410), (x0, box.y + 146), "s", C_TEXT)
+            for i, row in enumerate(rows[:12]):
+                y = box.y + 176 + i * 24
+                u_, st_, xp_ = row[0], row[1], row[2]
+                sc_ = row[3] if len(row) > 3 else ""
+                col = {"ok": C_GOOD, "fallen": C_WARN, "destroyed": C_BAD}[st_]
+                pygame.draw.rect(self.screen, C_PANEL2, (x0, y, 410, 22), border_radius=3)
+                pygame.draw.rect(self.screen, col, (x0, y, 4, 22), border_radius=2)
+                ui.text(ui.fit(u_.name, "xs", 190), (x0 + 10, y + 11), "xs", C_TEXT, "midleft")
+                ui.text(tr({"ok": "res.ok", "fallen": "res.fallen", "destroyed": "res.destroyed"}[st_]),
+                        (x0 + 210, y + 11), "xs", col, "midleft")
+                ui.text(f"+{xp_} XP", (x0 + 290, y + 11), "xs", C_DIM, "midleft")
+                if sc_ and st_ != "destroyed":
+                    scars_all.append(f"{u_.name}: {tr('scar.' + sc_)}")
+                    ui.text(ui.fit(tr("scar." + sc_), "xs", 90), (x0 + 340, y + 11), "xs", (236, 140, 70), "midleft")
+            if len(rows) > 12:
+                ui.text(tr("rep.more", n=len(rows) - 12), (x0, box.y + 176 + 12 * 24), "xs", C_DIM)
+        ui.text(ui.fit(tr("qr.scars", t="; ".join(scars_all)) if scars_all else tr("qr.no_scars"), "xs", 840),
+                (box.x + 14, box.bottom - 86), "xs", (236, 140, 70) if scars_all else C_DIM)
+        if ui.button((box.right - 234, box.bottom - 56, 220, 38), tr("qr.close"), color=(60, 120, 76)):
+            self.dialog = None
+            ui.focus = None
 
     # ---- resultado de batalla (diálogo modal) -------------------------------
     def open_result(self, q: Quadrant):
@@ -5644,9 +6750,21 @@ class App:
                     fi = clash.att_force
                 elif side == "def" and clash.def_fid == f.fid:
                     fi = clash.def_force
-            r["rows"][side] = [dict(unit=u, state="ok", xp=1, auto=True)
+            r["rows"][side] = [dict(unit=u, state="ok", xp=1, auto=True, scar="auto", roll=random.random(), pick=roll_scar())
                                for u in (camp.participants(q, f, fi) if f else [])]
         r["scroll"] = 0
+
+    @staticmethod
+    def res_scar(r: dict, side: str, row: dict) -> str:
+        """Cicatriz que recibirá la unidad: la elegida a mano o, en «Auto», una tirada según su estado."""
+        if row["scar"] != "auto":
+            return row["scar"]
+        lost_side = r["winner"] not in ("draw", side)
+        if row["state"] == "fallen" and row["roll"] < 0.45:
+            return row["pick"]
+        if row["state"] == "ok" and lost_side and row["roll"] < 0.12:
+            return row["pick"]
+        return ""
 
     def draw_result_dialog(self, ui: UI):
         camp, r = self.campaign, self.res
@@ -5698,7 +6816,8 @@ class App:
         r["scroll"] = clamp(r["scroll"], 0, max(0, longest - vis))
         for side, x0, head in (("att", box.x + 14, "res.att_units"), ("def", box.x + 546, "res.def_units")):
             ui.text(tr(head), (x0, box.y + 90), "xs", C_ACCENT)
-            ui.text(tr("army.lbl_status"), (x0 + 268, box.y + 90), "xs", C_DIM)
+            ui.text(tr("army.lbl_status"), (x0 + 158, box.y + 90), "xs", C_DIM)
+            ui.text(tr("res.scar_hdr"), (x0 + 250, box.y + 90), "xs", C_DIM)
             ui.text(tr("army.lbl_xp"), (x0 + 372, box.y + 90), "xs", C_DIM)
             rows = r["rows"][side]
             if not rows:
@@ -5707,11 +6826,19 @@ class App:
                 row = rows[i]
                 y = box.y + 108 + (i - r["scroll"]) * 30
                 pygame.draw.rect(self.screen, C_PANEL2, pygame.Rect(x0, y, 500, 28), border_radius=4)
-                ui.text(ui.fit(row["unit"].name, "s", 250), (x0 + 8, y + 14), "s", C_TEXT, "midleft")
+                ui.text(ui.fit(row["unit"].name, "s", 146), (x0 + 8, y + 14), "s", C_TEXT, "midleft")
                 st = row["state"]
-                if ui.button((x0 + 262, y + 2, 100, 24), tr(state_lab[st]), font="xs", color=state_col[st],
+                if ui.button((x0 + 158, y + 2, 88, 24), tr(state_lab[st]), font="xs", color=state_col[st],
                              tip=tr("res.state_tip")):
                     row["state"] = order[(order.index(st) + 1) % len(order)]
+                sc_key = self.res_scar(r, side, row)
+                if row["scar"] == "auto":
+                    slab = tr("res.scar_auto") + ((": " + tr("scar." + sc_key)) if sc_key else "")
+                else:
+                    slab = tr("scar." + row["scar"]) if row["scar"] else tr("scar.none_short")
+                if ui.button((x0 + 250, y + 2, 118, 24), slab, font="xs", active=bool(sc_key), tip=tr("res.scar_tip")):
+                    opts = ["auto", ""] + list(SCARS)
+                    row["scar"] = opts[(opts.index(row["scar"]) + 1) % len(opts)]
                 if row["auto"]:
                     row["xp"] = 0 if row["state"] != "ok" else 1 + (1 if r["winner"] == side else 0)
                 v = ui.stepper((x0 + 372, y + 2, 120, 24), row["xp"], 0, 9)
@@ -5727,8 +6854,8 @@ class App:
         if ui.button((box.right - 290, box.bottom - 56, 134, 30), tr("res.save"), color=(60, 120, 76),
                      enabled=r["att"] is not None):
             clash = r["clash"] if (r["clash"] and (r["clash"].att_fid, r["clash"].def_fid) == (r["att"], r["dfn"])) else None
-            att_rows = [(d["unit"], d["state"], d["xp"]) for d in r["rows"]["att"]]
-            def_rows = [(d["unit"], d["state"], d["xp"]) for d in r["rows"]["def"]]
+            att_rows = [(d["unit"], d["state"], d["xp"], self.res_scar(r, "att", d)) for d in r["rows"]["att"]]
+            def_rows = [(d["unit"], d["state"], d["xp"], self.res_scar(r, "def", d)) for d in r["rows"]["def"]]
             bt = self.battle
             msgs = camp.record_battle(q, r["att"], r["dfn"], r["winner"], att_rows, def_rows, r["note"], clash,
                                       bt.mission)
@@ -5973,11 +7100,11 @@ class App:
         pygame.draw.line(self.screen, C_LINE, (0, TOPBAR_H - 1), (WIN_W, TOPBAR_H - 1))
         ui.text("OPR Manager", (16, 12), "l", C_ACCENT)
         for i, (key, tab) in enumerate(self.TAB_KEYS):
-            if ui.button((190 + i * 154, 8, 150, 32), tr(key), active=(self.tab == tab)):
+            if ui.button((190 + i * 128, 8, 124, 32), tr(key), active=(self.tab == tab), font="xs"):
                 self.switch_tab(tab)
         n = len(self.slots)
         label = self.campaign.name + (f"  ({self.active + 1}/{n})" if n > 1 else "")
-        if ui.button((812, 8, 188, 32), label, tip=tr("top.files_tip"), font="xs"):
+        if ui.button((836, 8, 164, 32), label, tip=tr("top.files_tip"), font="xs"):
             self.open_files()
         for i, lang in enumerate(LANGS):
             if ui.button((1008 + i * 40, 8, 36, 32), lang.upper(), active=(LANG == lang),
@@ -5995,7 +7122,7 @@ class App:
                     C_BAD if self.status_err else C_GOOD, "midleft")
         else:
             ui.text(tr("status.hint"), (12, r.centery), "xs", C_DIM, "midleft")
-        ui.text("OPR Campaign & Battle Manager v6", (WIN_W - 12, r.centery), "xs", C_DIM, "midright")
+        ui.text("OPR Campaign & Battle Manager v7", (WIN_W - 12, r.centery), "xs", C_DIM, "midright")
 
     def draw_files_dialog(self, ui: UI):
         dim = pygame.Surface((WIN_W, WIN_H), pygame.SRCALPHA)
@@ -6145,8 +7272,9 @@ class App:
                         if ctrl and e.key == pygame.K_l:
                             self.open_files()
                             continue
-                        if not ctrl and not self.dialog and e.key in (pygame.K_1, pygame.K_2, pygame.K_3, pygame.K_4):
-                            self.switch_tab(("campaign", "battle", "factions", "hall")[e.key - pygame.K_1])
+                        if not ctrl and not self.dialog and e.key in (pygame.K_1, pygame.K_2, pygame.K_3,
+                                                                       pygame.K_4, pygame.K_5):
+                            self.switch_tab(("campaign", "battle", "factions", "hall", "stats")[e.key - pygame.K_1])
                 if self.dialog:
                     continue
                 if e.type in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP,
@@ -6155,6 +7283,11 @@ class App:
                         continue
                     self.views[self.tab].handle_event(e, ui)
 
+            u_ = self.updater
+            if u_.done and not u_.handled and u_.info and self.dialog is None:
+                u_.handled = True
+                self.dialog = "update"
+                ui.focus = None
             ui.begin(events)
             self.screen.fill(C_BG)
             ui.input_enabled = self.dialog is None
@@ -6170,6 +7303,10 @@ class App:
                 self.draw_books_dialog(ui)
             elif self.dialog == "catalog":
                 self.draw_catalog_dialog(ui)
+            elif self.dialog == "quick":
+                self.draw_quick_dialog(ui)
+            elif self.dialog == "update":
+                self.draw_update_dialog(ui)
             ui.draw_tooltip()
             self.present()
             self.clock.tick(FPS)
@@ -6178,5 +7315,11 @@ class App:
 
 
 if __name__ == "__main__":
-    App().run()
+    _app = App()
+    _app.run()
+    if getattr(_app, "restart", False):                  # tras «Instalar y reiniciar»
+        try:
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+        except OSError:
+            pass
     sys.exit(0)
